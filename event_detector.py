@@ -150,10 +150,13 @@ class EventDetector:
 
     def _take_out(self, bbox, ref_ident):
         rec = self._match_item(bbox)
-        if rec is None:
-            return []  # 记忆里没有对应物品，不误更新库存
-        self.placed_items.remove(rec)
-        return [('TAKE_OUT', {'removed': {rec['class_id']: 1}})]
+        if rec is not None:
+            self.placed_items.remove(rec)
+            return [('TAKE_OUT', {'removed': {rec['class_id']: 1}})]
+        # 记忆未命中：回退用模型识别出的旧物品类别，避免吞掉出库事件
+        if ref_ident is not None:
+            return [('TAKE_OUT', {'removed': {ref_ident['class_id']: 1}})]
+        return []
 
     def _handle_same(self, r):
         """同位置同粗类：按检测框面积判断部分取出 / 追加 / 位置抖动"""

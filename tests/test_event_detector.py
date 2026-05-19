@@ -112,3 +112,13 @@ def test_partial_take_out_on_area_shrink():
     region = ChangedRegion((10, 10, 40, 40), 'SAME', big, small)
     events = det._analyze_regions([region])
     assert events == [('PARTIAL_TAKE_OUT', {'removed': {0: 1}})]
+
+
+def test_take_out_falls_back_to_ref_ident_when_memory_misses():
+    # 记忆为空（未命中），但 ref_ident 已识别出旧物品 → 仍应发出 TAKE_OUT
+    apple = _ident(0, 'Apple', '蔬果', 1000.0)
+    det = EventDetector(_fake_motion, None)
+    det.seed(STILL, [])  # 空记忆
+    region = ChangedRegion((10, 10, 40, 40), 'DISAPPEAR', apple, None)
+    events = det._analyze_regions([region])
+    assert events == [('TAKE_OUT', {'removed': {0: 1}})]
