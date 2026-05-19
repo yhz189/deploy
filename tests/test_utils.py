@@ -35,23 +35,15 @@ def _make_outputs(boxes_xyxy, class_id, scores):
 
 
 def test_postprocess_nms_dedups_overlapping_boxes():
-    # 三个框：两个重叠的高置信度框 + 一个低置信度的小框
-    # 框0: [100,100,200,200] 置信度 0.9（高置信度）
-    # 框1: [105,105,205,205] 置信度 0.88（与框0重叠，高置信度）
-    # 框2: [130,130,170,170] 置信度 0.35（低置信度，在框0内）
-    # NMS 应该根据坐标格式正确计算 IoU：
-    # - 框0和框1 IoU≈0.96 > 0.45，框1应被去掉
-    # - 框0和框2 IoU>0.45，框2应被去掉（或保留，取决于 NMS 实现）
+    # 两个几乎重合的同类框 + 一个独立框 → NMS 后应剩 2 个
     outputs = _make_outputs(
-        boxes_xyxy=[(100, 100, 200, 200),
-                    (105, 105, 205, 205),
-                    (130, 130, 170, 170)],
+        boxes_xyxy=[(100, 100, 150, 150),
+                    (105, 105, 155, 155),
+                    (300, 300, 360, 360)],
         class_id=0,
-        scores=[0.9, 0.88, 0.35],
+        scores=[0.9, 0.8, 0.85],
     )
     boxes, confs, class_ids = postprocess(
         outputs, ratio=1.0, pad=(0, 0), orig_shape=(480, 640, 3))
-    # 应该保留框0（最高置信度），去掉与框0 IoU > 0.45 的框
-    assert len(boxes) >= 1
-    assert any(np.array_equal(box, np.array([100, 100, 200, 200])) for box in boxes)
+    assert len(boxes) == 2
     assert all(c == 0 for c in class_ids)
