@@ -24,7 +24,7 @@ def to_coarse(class_id):
 
 
 IMG_SIZE = 416
-CONF_THRESH = 0.60
+CONF_THRESH = 0.30
 NMS_THRESH = 0.45
 
 
@@ -95,9 +95,10 @@ def postprocess(outputs, ratio, pad, orig_shape):
 
     boxes = np.stack([x1, y1, x2, y2], axis=1)
 
-    # NMS
+    # NMS：cv2.dnn.NMSBoxes 要求 [x, y, w, h] 格式，需从 xyxy 转换
+    boxes_xywh = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1)
     indices = cv2.dnn.NMSBoxes(
-        boxes.tolist(), confidences.tolist(), CONF_THRESH, NMS_THRESH
+        boxes_xywh.tolist(), confidences.tolist(), CONF_THRESH, NMS_THRESH
     )
     if len(indices) == 0:
         return [], [], []
