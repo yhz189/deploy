@@ -25,6 +25,7 @@ HTML = '''
         .empty { color: #999; text-align: center; padding: 20px; }
         .badge { background:#4CAF50; color:white; padding:2px 8px; border-radius:12px; font-size:12px; }
         .badge-out { background:#f44336; }
+        .badge-partial { background:#ff9800; }
         .time { color: #888; font-size: 12px; }
     </style>
 </head>
@@ -61,6 +62,8 @@ HTML = '''
                 <td>
                     {% if 'PUT_IN' in etype %}
                     <span class="badge">放入</span>
+                    {% elif 'PARTIAL' in etype %}
+                    <span class="badge badge-partial">部分取出·估计</span>
                     {% else %}
                     <span class="badge badge-out">取出</span>
                     {% endif %}
