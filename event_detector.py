@@ -1,130 +1,184 @@
-import cv2
-from collections import Counter
+"""事件检测器：两态状态机 + 物品位置记忆 + 变化定位事件派生"""
+
+PARTIAL_AREA_RATIO = 0.7
+IOU_MATCH_THRESH = 0.3
+SIZE_MATCH_TOLERANCE = 0.3
+
+
+def _iou(b1, b2):
+    """两个 (x, y, w, h) 框的 IoU"""
+    x1, y1, w1, h1 = b1
+    x2, y2, w2, h2 = b2
+    ix1, iy1 = max(x1, x2), max(y1, y2)
+    ix2, iy2 = min(x1 + w1, x2 + w2), min(y1 + h1, y2 + h2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    union = w1 * h1 + w2 * h2 - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _size_similar(b1, b2):
+    a1, a2 = b1[2] * b1[3], b2[2] * b2[3]
+    if max(a1, a2) == 0:
+        return False
+    return abs(a1 - a2) / max(a1, a2) <= SIZE_MATCH_TOLERANCE
 
 
 class EventDetector:
 
-    def __init__(self):
-        self.state = 'IDLE'
-        self.baseline_counts = {}
-        self.stable_counts = {}
-        self.stable_frames = 0
-        self.idle_frames = 0
-        self.IDLE_NEED = 10
-        self.VOTE_FRAMES = 15  # 收集15帧
-        self.vote_pool = []
-        self.bg_sub = cv2.createBackgroundSubtractorMOG2(
-            history=200, varThreshold=60, detectShadows=False
-        )
+    def __init__(self, motion_fn, locate_fn,
+                 enter_frames=3, exit_frames=10, settle_frames=5):
+        self.motion_fn = motion_fn      # (prev_bgr, cur_bgr) -> bool
+        self.locate_fn = locate_fn      # (ref_bgr, new_bgr) -> list[ChangedRegion]
+        self.enter_frames = enter_frames
+        self.exit_frames = exit_frames
+        self.settle_frames = settle_frames
 
-    def _to_counts(self, dets):
-        c = Counter()
-        for cls_id, conf, box in dets:
-            c[int(cls_id)] += 1
-        return dict(c)
+        self.state = 'STABLE'
+        self.prev_frame = None
+        self.ref_frame = None
+        self.placed_items = []
+        self._next_id = 1
+        self._moving_streak = 0
+        self._still_streak = 0
+        self._settle_streak = 0
+        self._settle_frame = None
 
-    def _detect_motion(self, frame):
-        fg = self.bg_sub.apply(frame)
-        return cv2.countNonZero(fg) > 8000
+    def seed(self, frame, detections):
+        """开机播种：detections 为 [{'class_id','fine','coarse','bbox'}, ...]"""
+        self.ref_frame = frame.copy()
+        self.prev_frame = frame.copy()
+        for d in detections:
+            self._add_item(d['class_id'], d['fine'], d['coarse'], d['bbox'])
 
-    def _similar(self, a, b, tol=1):
-        all_k = set(a.keys()) | set(b.keys())
-        return all(abs(a.get(k, 0) - b.get(k, 0)) <= tol for k in all_k)
+    def _add_item(self, class_id, fine, coarse, bbox):
+        rec = {'id': self._next_id, 'class_id': class_id,
+               'fine': fine, 'coarse': coarse, 'bbox': bbox}
+        self.placed_items.append(rec)
+        self._next_id += 1
+        return rec
 
-    def _total_diff(self, a, b):
-        all_k = set(a.keys()) | set(b.keys())
-        return sum(abs(a.get(k, 0) - b.get(k, 0)) for k in all_k)
+    def update(self, frame):
+        """喂入一帧，返回 (events, state)。events 为事件元组列表。"""
+        events = []
+        if self.prev_frame is None:
+            self.prev_frame = frame.copy()
+            self.ref_frame = frame.copy()
+            return events, self.state
 
-    def compare_detections(self, before, after):
-        all_cls = set(before.keys()) | set(after.keys())
-        added, removed = {}, {}
-        for cls in all_cls:
-            b, a = before.get(cls, 0), after.get(cls, 0)
-            if a > b:
-                added[cls] = a - b
-            elif a < b:
-                removed[cls] = b - a
+        moving = self.motion_fn(self.prev_frame, frame)
+        self.prev_frame = frame.copy()
 
-        if added and not removed:
-            return 'PUT_IN', {'added': added}
-        elif removed and not added:
-            is_partial = any(before.get(c, 0) > n for c, n in removed.items())
-            etype = 'PARTIAL_TAKE_OUT' if is_partial else 'TAKE_OUT'
-            return etype, {'removed': removed}
-        elif added and removed:
-            return 'EXCHANGE', {'added': added, 'removed': removed}
-        return 'NO_EVENT', {}
-
-    def update(self, frame, current_dets):
-        has_motion = self._detect_motion(frame)
-        current_counts = self._to_counts(current_dets)
-        event = None
-
-        if self.state == 'IDLE':
-            if self._similar(current_counts, self.stable_counts):
-                self.idle_frames += 1
-                if self.idle_frames >= self.IDLE_NEED:
-                    self.baseline_counts = dict(self.stable_counts)
-                    self.state = 'WATCHING'
-                    self.idle_frames = 0
-                    print(f'[事件] 开始监听，基准: {self.baseline_counts}')
+        if self.state == 'STABLE':
+            if moving:
+                self._moving_streak += 1
+                if self._moving_streak >= self.enter_frames:
+                    self.state = 'BUSY'
+                    self._moving_streak = 0
+                    self._still_streak = 0
             else:
-                self.stable_counts = current_counts
-                self.idle_frames = 0
+                self._moving_streak = 0
+                self.ref_frame = frame.copy()  # 静止期持续刷新参考图
 
-        elif self.state == 'WATCHING':
-            if self._total_diff(current_counts, self.baseline_counts) > 1:
-                self.state = 'WAITING'
-                self.stable_counts = current_counts
-                self.stable_frames = 1
-                print(f'[事件] 检测到变化: {self.baseline_counts} -> {current_counts}')
+        elif self.state == 'BUSY':
+            if moving:
+                self._still_streak = 0
+            else:
+                self._still_streak += 1
+                if self._still_streak >= self.exit_frames:
+                    self.state = 'SETTLING'
+                    self._settle_streak = 0
+                    self._settle_frame = frame.copy()
 
+        elif self.state == 'SETTLING':
+            if moving:
+                self.state = 'BUSY'
+                self._still_streak = 0
+            else:
+                self._settle_streak += 1
+                if self._settle_streak >= self.settle_frames:
+                    events = self._analyze(self._settle_frame)
+                    self.ref_frame = self._settle_frame.copy()
+                    self.state = 'STABLE'
 
-        elif self.state == 'WAITING':
+        return events, self.state
 
-            self.vote_pool.append(current_counts)
+    def _analyze(self, new_frame):
+        regions = self.locate_fn(self.ref_frame, new_frame)
+        return self._analyze_regions(regions)
 
-            if len(self.vote_pool) >= self.VOTE_FRAMES:
+    def _analyze_regions(self, regions):
+        events = []
+        appears, disappears = [], []
+        for r in regions:
+            if r.kind == 'APPEAR':
+                appears.append(r)
+            elif r.kind == 'DISAPPEAR':
+                disappears.append(r)
+            elif r.kind == 'REPLACE':
+                events += self._take_out(r.bbox, r.ref_ident)
+                events += self._put_in(r.bbox, r.new_ident)
+            elif r.kind == 'SAME':
+                events += self._handle_same(r)
+        events += self._cross_check(appears, disappears)
+        return events
 
-                # 找出现次数最多的counts
+    def _cross_check(self, appears, disappears):
+        """整理交叉核对：同粗类、尺寸相近的一出一进配对为「整理」，不计事件"""
+        events = []
+        unmatched = list(disappears)
+        for a in appears:
+            match = None
+            for d in unmatched:
+                if (a.new_ident['coarse'] == d.ref_ident['coarse']
+                        and _size_similar(a.bbox, d.bbox)):
+                    match = d
+                    break
+            if match is not None:
+                unmatched.remove(match)
+                self._move_item(match.bbox, a.bbox)  # 整理：更新位置记忆
+            else:
+                events += self._put_in(a.bbox, a.new_ident)
+        for d in unmatched:
+            events += self._take_out(d.bbox, d.ref_ident)
+        return events
 
-                str_pool = [str(sorted(c.items())) for c in self.vote_pool]
+    def _put_in(self, bbox, ident):
+        self._add_item(ident['class_id'], ident['fine'],
+                       ident['coarse'], bbox)
+        return [('PUT_IN', {'added': {ident['class_id']: 1}})]
 
-                winner_str = max(set(str_pool), key=str_pool.count)
+    def _take_out(self, bbox, ref_ident):
+        rec = self._match_item(bbox)
+        if rec is None:
+            return []  # 记忆里没有对应物品，不误更新库存
+        self.placed_items.remove(rec)
+        return [('TAKE_OUT', {'removed': {rec['class_id']: 1}})]
 
-                winner_count = str_pool.count(winner_str)
+    def _handle_same(self, r):
+        """同位置同粗类：按检测框面积判断部分取出 / 追加 / 位置抖动"""
+        ra = r.ref_ident['area']
+        na = r.new_ident['area']
+        if ra <= 0:
+            return []
+        if na < ra * PARTIAL_AREA_RATIO:
+            rec = self._match_item(r.bbox)
+            cid = rec['class_id'] if rec else r.ref_ident['class_id']
+            return [('PARTIAL_TAKE_OUT', {'removed': {cid: 1}})]
+        if na > ra / PARTIAL_AREA_RATIO:
+            return self._put_in(r.bbox, r.new_ident)
+        return []  # 面积相当，判为位置抖动，忽略
 
-                # 从pool里找回对应的dict
+    def _match_item(self, bbox):
+        """按 IoU 在位置记忆里找最匹配的物品"""
+        best, best_iou = None, IOU_MATCH_THRESH
+        for rec in self.placed_items:
+            iou = _iou(rec['bbox'], bbox)
+            if iou >= best_iou:
+                best, best_iou = rec, iou
+        return best
 
-                new_counts = {}
-
-                for c in self.vote_pool:
-
-                    if str(sorted(c.items())) == winner_str:
-                        new_counts = c
-
-                        break
-
-                print(f'[投票] 众数: {new_counts} ({winner_count}/{self.VOTE_FRAMES}帧)')
-
-                event_type, details = self.compare_detections(
-
-                    self.baseline_counts, new_counts
-
-                )
-
-                print(f'[事件] 确认: {event_type} {details}')
-
-                if event_type != 'NO_EVENT':
-                    event = (event_type, details, current_dets)
-
-                    self.baseline_counts = dict(new_counts)
-
-                self.vote_pool = []
-
-                self.state = 'IDLE'
-
-                self.idle_frames = 0
-
-        # 确保始终返回三元组
-        return event, self.state, has_motion
+    def _move_item(self, old_bbox, new_bbox):
+        rec = self._match_item(old_bbox)
+        if rec is not None:
+            rec['bbox'] = new_bbox
