@@ -1,17 +1,66 @@
+"""冰箱食材识别与管理系统 - 主程序
+
+实时模式：  python main.py
+回放模式：  python main.py --replay results/clip   （喂帧序列目录调试）
 """
-冰箱食材识别与管理系统 - 主程序
-"""
-import cv2
-import time
 import os
+import sys
+import glob
+import time
+
+import cv2
 from rknnlite.api import RKNNLite
-from utils import preprocess, postprocess, draw_results
+
+from utils import preprocess, postprocess, identify_crop, to_coarse, CLASSES
+from motion import is_moving
+from change_locator import find_change_regions, classify_regions
 from event_detector import EventDetector
 from inventory import InventoryManager
 
 RKNN_MODEL = 'models/fridge_yolo_fp16.rknn'
 CAMERA_ID = 0
-INFER_EVERY = 3
+
+
+def open_source():
+    """返回一个逐帧产出 BGR 图的生成器；支持实时摄像头与回放目录"""
+    if len(sys.argv) >= 3 and sys.argv[1] == '--replay':
+        paths = sorted(glob.glob(os.path.join(sys.argv[2], '*.jpg')))
+        assert paths, f'回放目录无 jpg：{sys.argv[2]}'
+        for p in paths:
+            img = cv2.imread(p)
+            if img is not None:
+                yield img
+    else:
+        cap = cv2.VideoCapture(CAMERA_ID)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        assert cap.isOpened(), '摄像头打开失败'
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    time.sleep(0.05)
+                    continue
+                yield frame
+        finally:
+            cap.release()
+
+
+def seed_detections(model, frame):
+    """开机全画面检测一次，给位置记忆与库存播种"""
+    img_input, ratio, pad = preprocess(frame)
+    outputs = model.inference(inputs=[img_input])
+    if outputs is None or outputs[0] is None:
+        return []
+    boxes, confs, class_ids = postprocess(outputs, ratio, pad, frame.shape)
+    dets = []
+    for box, cid in zip(boxes, class_ids):
+        x1, y1, x2, y2 = box
+        dets.append({'class_id': int(cid), 'fine': CLASSES[int(cid)],
+                     'coarse': to_coarse(int(cid)),
+                     'bbox': (int(x1), int(y1),
+                              int(x2 - x1), int(y2 - y1))})
+    return dets
 
 
 def main():
@@ -20,104 +69,47 @@ def main():
     model.init_runtime()
     print('✓ 模型加载成功')
 
-    detector = EventDetector()
     inv = InventoryManager()
-    print('✓ 事件检测器 & 库存管理器就绪')
 
-    cap = cv2.VideoCapture(CAMERA_ID)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    assert cap.isOpened(), '摄像头打开失败'
-    print('✓ 摄像头就绪\n')
+    def classify_fn(crop):
+        return identify_crop(model, crop)
 
-    os.makedirs('results', exist_ok=True)
+    def locate_fn(ref, new):
+        bboxes = find_change_regions(ref, new)
+        return classify_regions(ref, new, bboxes, classify_fn)
+
+    detector = EventDetector(is_moving, locate_fn)
+    print('✓ 事件检测器就绪')
+
+    frames = open_source()
+    first = next(frames, None)
+    assert first is not None, '无可用帧'
+
+    dets = seed_detections(model, first)
+    detector.seed(first, dets)
+    for d in dets:
+        inv.process_event('PUT_IN', {'added': {d['class_id']: 1}})
+    print(f'✓ 开机播种：{len(dets)} 个物品')
     inv.print_stock()
 
     frame_count = 0
-    last_boxes, last_confs, last_class_ids = [], [], []
-    last_event_type = 'NONE'
-    state = 'IDLE'
-    has_motion = False
-
     try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.1)
-                continue
-
+        for frame in frames:
             frame_count += 1
-
-            if frame_count % INFER_EVERY == 0:
-                img_input, ratio, pad = preprocess(frame)
-                outputs = model.inference(inputs=[img_input])
-
-                if outputs is not None and outputs[0] is not None:
-                    last_boxes, last_confs, last_class_ids = postprocess(
-                        outputs, ratio, pad, frame.shape
-                    )
-
-                current_dets = list(zip(last_class_ids, last_confs, last_boxes)) \
-                    if len(last_boxes) > 0 else []
-
-                result, state, has_motion = detector.update(frame, current_dets)
-
-                if result:
-                    event_type, details, _ = result
-                    last_event_type = event_type
-                    if event_type != 'NO_EVENT':
-                        inv.process_event(event_type, details)
-                        inv.print_stock()
-            else:
-                result, state, has_motion = detector.update(frame, [])
-
-            # 显示
-            display = frame.copy()
-            if len(last_boxes) > 0:
-                display = draw_results(display, last_boxes, last_confs, last_class_ids)
-
-            state_color = {
-                'IDLE': (0,255,0),
-                'DOOR_OPEN': (0,165,255),
-                'COMPARING': (0,0,255)
-            }.get(state, (255,255,255))
-
-            cv2.putText(display, f'State:{state}', (10,30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, state_color, 2)
-            cv2.putText(display, f'Motion:{"YES" if has_motion else "NO"}',
-                (10,60), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (0,0,255) if has_motion else (0,255,0), 2)
-            cv2.putText(display, f'Targets:{len(last_boxes)}',
-                (10,90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-            cv2.putText(display, f'Event:{last_event_type}',
-                (10,120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,255), 2)
-
-            cv2.imshow('Fridge System', display)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
+            events, state = detector.update(frame)
+            for event_type, details in events:
+                inv.process_event(event_type, details)
+                print(f'[事件] {event_type} {details}')
+                inv.print_stock()
             if frame_count % 30 == 0:
-                stock = inv.get_current_stock()
-                stock_str = ', '.join(
-                    [f'{n}x{q}' for n,q,_,_ in stock]
-                ) or '空'
-                print(f'帧{frame_count:5d} | {state:10s} | '
-                      f'运动:{"有" if has_motion else "无"} | '
-                      f'目标:{len(last_boxes):2d} | 库存:[{stock_str}]')
-
+                print(f'帧{frame_count:5d} | 状态:{state}')
     except KeyboardInterrupt:
         print('\n用户中断')
-
     finally:
         print('\n====== 最终库存 ======')
         inv.print_stock()
-        print('====== 事件记录 ======')
-        for row in inv.get_recent_events(20):
-            print(f'  {row[0]} | {row[1]:20s} | {row[2]}')
-        cv2.destroyAllWindows()
-        cap.release()
-        model.release()
         inv.close()
+        model.release()
         print('系统退出')
 
 
