@@ -1,4 +1,5 @@
-from utils import to_coarse, CLASSES
+import numpy as np
+from utils import to_coarse, CLASSES, postprocess, identify_crop
 
 
 def test_to_coarse_dairy():
@@ -18,10 +19,6 @@ def test_to_coarse_covers_all_classes():
     # 17 个细类每个都要有粗类映射
     for cid in range(len(CLASSES)):
         assert to_coarse(cid) in ('蔬果', '生鲜', '乳品', '包装食品')
-
-
-import numpy as np
-from utils import postprocess
 
 
 def _make_outputs(boxes_xyxy, class_id, scores):
@@ -47,9 +44,6 @@ def test_postprocess_nms_dedups_overlapping_boxes():
         outputs, ratio=1.0, pad=(0, 0), orig_shape=(480, 640, 3))
     assert len(boxes) == 2
     assert all(c == 0 for c in class_ids)
-
-
-from utils import identify_crop
 
 
 class _FakeModel:
@@ -78,3 +72,12 @@ def test_identify_crop_empty_returns_none():
     model = _FakeModel(None)
     assert identify_crop(model, None) is None
     assert identify_crop(model, np.zeros((0, 0, 3), dtype=np.uint8)) is None
+
+
+def test_identify_crop_no_detection_returns_none():
+    crop = np.full((80, 80, 3), 120, dtype=np.uint8)
+    # 得分低于 CONF_THRESH(0.30)，postprocess 过滤后无框 → identify_crop 应返回 None
+    outputs = _make_outputs(
+        boxes_xyxy=[(10, 10, 60, 60)], class_id=0, scores=[0.1])
+    model = _FakeModel(outputs)
+    assert identify_crop(model, crop) is None
