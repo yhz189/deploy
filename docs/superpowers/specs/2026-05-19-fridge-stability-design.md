@@ -69,7 +69,7 @@ change_locator: diff(参考图, new) → 变化区域列表
   ↓
 [交叉核对] 消失 × 出现 同粗类 → 判「整理」，不计库存事件
   ↓
-派生事件 PUT_IN / TAKE_OUT / PARTIAL_TAKE_OUT / REPLACE
+派生事件并归一为库存事件 PUT_IN / TAKE_OUT / PARTIAL_TAKE_OUT
   ↓
 更新 SQLite 库存（粗类为准，细类作推测）+ 物品位置记忆 + 参考图 ← new
   ↓
@@ -154,7 +154,7 @@ locate_changes(ref_frame, new_frame) -> list[ChangedRegion]
 2. 未配对的 APPEAR → `PUT_IN`；未配对的 DISAPPEAR → `TAKE_OUT`（从记忆查得是什么）。
 3. REPLACE → 该位置 `TAKE_OUT(旧)` + `PUT_IN(新)`。
 
-派生事件仍为 `('PUT_IN', {'added': {...}})` 形式的元组，`inventory.py` 的 `process_event` 无需改动。
+**事件类型口径**：送入 `inventory.py` 的库存事件只有 `PUT_IN` / `TAKE_OUT` / `PARTIAL_TAKE_OUT` 三种。REPLACE 与 §6 的 PARTIAL_PUT_IN 是内部分类，在此处归一映射——REPLACE 拆为 `TAKE_OUT` + `PUT_IN`，PARTIAL_PUT_IN 映射为 `PUT_IN`（`process_event` 的 `_put_in` 已支持同类数量叠加）。派生事件仍为 `('PUT_IN', {'added': {...}})` 形式的元组，`inventory.py` 的 `process_event` 无需改动（其 `EXCHANGE` 分支在新设计下不再被触发，保留为冗余无害）。
 
 ## 6. 部分取出策略
 
@@ -216,6 +216,7 @@ locate_changes(ref_frame, new_frame) -> list[ChangedRegion]
 | `CONF_THRESH` | 裁剪识别置信度阈值 | 0.25~0.35 |
 | `PARTIAL_AREA_RATIO` | 部分取出面积比阈值 | 0.7 |
 | `IOU_MATCH_THRESH` | 位置记忆匹配 IoU 阈值 | 0.3 |
+| `SIZE_MATCH_TOLERANCE` | 整理交叉核对的尺寸相近容差 | 0.3 |
 
 ## 12. 范围与非目标（YAGNI）
 
