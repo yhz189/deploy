@@ -47,3 +47,34 @@ def test_postprocess_nms_dedups_overlapping_boxes():
         outputs, ratio=1.0, pad=(0, 0), orig_shape=(480, 640, 3))
     assert len(boxes) == 2
     assert all(c == 0 for c in class_ids)
+
+
+from utils import identify_crop
+
+
+class _FakeModel:
+    """模拟 RKNNLite：inference 返回预置的 outputs"""
+    def __init__(self, outputs):
+        self._outputs = outputs
+
+    def inference(self, inputs):
+        return self._outputs
+
+
+def test_identify_crop_returns_best_detection():
+    crop = np.full((80, 80, 3), 120, dtype=np.uint8)
+    outputs = _make_outputs(
+        boxes_xyxy=[(10, 10, 60, 60)], class_id=0, scores=[0.85])
+    model = _FakeModel(outputs)
+    ident = identify_crop(model, crop)
+    assert ident is not None
+    assert ident['class_id'] == 0
+    assert ident['fine'] == 'Apple'
+    assert ident['coarse'] == '蔬果'
+    assert ident['area'] > 0
+
+
+def test_identify_crop_empty_returns_none():
+    model = _FakeModel(None)
+    assert identify_crop(model, None) is None
+    assert identify_crop(model, np.zeros((0, 0, 3), dtype=np.uint8)) is None

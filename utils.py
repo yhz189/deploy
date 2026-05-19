@@ -126,3 +126,27 @@ def draw_results(img, boxes, confs, class_ids):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     return img
+
+
+def identify_crop(model, crop_bgr):
+    """对一张裁剪图运行识别，返回置信度最高的检测结果或 None"""
+    if crop_bgr is None or crop_bgr.size == 0:
+        return None
+    img_input, ratio, pad = preprocess(crop_bgr)
+    outputs = model.inference(inputs=[img_input])
+    if outputs is None or outputs[0] is None:
+        return None
+    boxes, confs, class_ids = postprocess(
+        outputs, ratio, pad, crop_bgr.shape)
+    if len(boxes) == 0:
+        return None
+    best = int(np.argmax(confs))
+    cid = int(class_ids[best])
+    x1, y1, x2, y2 = boxes[best]
+    return {
+        'class_id': cid,
+        'fine': CLASSES[cid],
+        'coarse': to_coarse(cid),
+        'conf': float(confs[best]),
+        'area': float(abs((x2 - x1) * (y2 - y1))),
+    }
