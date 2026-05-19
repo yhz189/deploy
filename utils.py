@@ -8,6 +8,21 @@ CLASSES = ['Apple', 'Avocado', 'Banana', 'Bell pepper', 'Bread', 'Broccoli',
            'Butter', 'Carrot', 'Cheese', 'Chicken', 'Cooking cream', 'Eggs',
            'Garlic', 'Hot Sauce', 'Ketchup', 'Lemon', 'Tomato']
 
+COARSE_MAP = {
+    'Apple': '蔬果', 'Avocado': '蔬果', 'Banana': '蔬果',
+    'Bell pepper': '蔬果', 'Broccoli': '蔬果', 'Carrot': '蔬果',
+    'Garlic': '蔬果', 'Lemon': '蔬果', 'Tomato': '蔬果',
+    'Chicken': '生鲜', 'Eggs': '生鲜',
+    'Butter': '乳品', 'Cheese': '乳品', 'Cooking cream': '乳品',
+    'Bread': '包装食品', 'Hot Sauce': '包装食品', 'Ketchup': '包装食品',
+}
+
+
+def to_coarse(class_id):
+    """细类 id → 粗分类名称"""
+    return COARSE_MAP[CLASSES[class_id]]
+
+
 IMG_SIZE = 416
 CONF_THRESH = 0.60
 NMS_THRESH = 0.45
