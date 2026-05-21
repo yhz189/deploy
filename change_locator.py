@@ -44,7 +44,8 @@ def classify_regions(ref_bgr, new_bgr, bboxes, classify_fn):
         new_id = classify_fn(new_crop)
 
         if ref_id is None and new_id is None:
-            continue  # 噪声/阴影，丢弃
+            regions.append(ChangedRegion((x, y, w, h), 'NOISE', None, None))
+            continue
         elif ref_id is None:
             kind = 'APPEAR'
         elif new_id is None:

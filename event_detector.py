@@ -120,6 +120,11 @@ class EventDetector:
                 events += self._put_in(r.bbox, r.new_ident)
             elif r.kind == 'SAME':
                 events += self._handle_same(r)
+            elif r.kind == 'NOISE':
+                rec = self._match_item(r.bbox)
+                if rec is not None:
+                    self.placed_items.remove(rec)
+                    events.append(('TAKE_OUT', {'removed': {rec['class_id']: 1}}))
         events += self._cross_check(appears, disappears)
         return events
 
@@ -144,9 +149,11 @@ class EventDetector:
         return events
 
     def _put_in(self, bbox, ident):
-        self._add_item(ident['class_id'], ident['fine'],
-                       ident['coarse'], bbox)
-        return [('PUT_IN', {'added': {ident['class_id']: 1}})]
+        count = ident.get('count', 1)
+        for _ in range(count):
+            self._add_item(ident['class_id'], ident['fine'],
+                           ident['coarse'], bbox)
+        return [('PUT_IN', {'added': {ident['class_id']: count}})]
 
     def _take_out(self, bbox, ref_ident):
         rec = self._match_item(bbox)

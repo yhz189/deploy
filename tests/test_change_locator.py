@@ -63,9 +63,12 @@ def test_classify_disappear():
     assert regions[0].kind == 'DISAPPEAR'
 
 
-def test_classify_noise_dropped():
+def test_classify_noise_returns_noise_region():
     ref = np.zeros((100, 100, 3), dtype=np.uint8)
     new = np.zeros((100, 100, 3), dtype=np.uint8)
-    classify_fn = _fake_classify({0: None})  # 两侧都识别不出
+    classify_fn = _fake_classify({0: None})  # 两侧都识别不出 → 返回 NOISE，由 event_detector 用记忆判断
     regions = classify_regions(ref, new, [(0, 0, 50, 50)], classify_fn)
-    assert regions == []
+    assert len(regions) == 1
+    assert regions[0].kind == 'NOISE'
+    assert regions[0].ref_ident is None
+    assert regions[0].new_ident is None

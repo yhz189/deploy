@@ -2,29 +2,28 @@ import numpy as np
 from utils import to_coarse, CLASSES, postprocess, identify_crop
 
 
-def test_to_coarse_dairy():
-    # Butter / Cheese / Cooking cream 都应归入「乳品」
-    butter_id = CLASSES.index('Butter')
-    cheese_id = CLASSES.index('Cheese')
-    assert to_coarse(butter_id) == '乳品'
-    assert to_coarse(cheese_id) == '乳品'
+def test_to_coarse_fruit():
+    apple_id = CLASSES.index('apple')
+    banana_id = CLASSES.index('banana')
+    assert to_coarse(apple_id) == '水果'
+    assert to_coarse(banana_id) == '水果'
 
 
-def test_to_coarse_produce():
-    assert to_coarse(CLASSES.index('Apple')) == '蔬果'
-    assert to_coarse(CLASSES.index('Tomato')) == '蔬果'
+def test_to_coarse_vegetable():
+    assert to_coarse(CLASSES.index('Onion')) == '蔬菜'
+    assert to_coarse(CLASSES.index('Tomato')) == '蔬菜'
 
 
 def test_to_coarse_covers_all_classes():
-    # 17 个细类每个都要有粗类映射
+    # 19 个细类每个都要有粗类映射
     for cid in range(len(CLASSES)):
-        assert to_coarse(cid) in ('蔬果', '生鲜', '乳品', '包装食品')
+        assert to_coarse(cid) in ('水果', '蔬菜')
 
 
 def _make_outputs(boxes_xyxy, class_id, scores):
-    """构造 (1, 21, N, 1) 的模型输出：前 4 行 xyxy，后 17 行类别得分"""
+    """构造 (1, 4+len(CLASSES), N, 1) 的模型输出：前 4 行 xyxy，后 N 行类别得分"""
     n = len(boxes_xyxy)
-    pred = np.zeros((1, 21, n, 1), dtype=np.float32)
+    pred = np.zeros((1, 4 + len(CLASSES), n, 1), dtype=np.float32)
     for i, (box, score) in enumerate(zip(boxes_xyxy, scores)):
         pred[0, 0:4, i, 0] = box
         pred[0, 4 + class_id, i, 0] = score
@@ -63,9 +62,24 @@ def test_identify_crop_returns_best_detection():
     ident = identify_crop(model, crop)
     assert ident is not None
     assert ident['class_id'] == 0
-    assert ident['fine'] == 'Apple'
-    assert ident['coarse'] == '蔬果'
+    assert ident['fine'] == 'apple'
+    assert ident['coarse'] == '水果'
     assert ident['area'] > 0
+    assert ident['count'] == 1
+
+
+def test_identify_crop_counts_multiple_same_class():
+    # 三个互不重叠的同类框 → count 应为 3（不被 NMS 合并）
+    crop = np.full((400, 400, 3), 120, dtype=np.uint8)
+    outputs = _make_outputs(
+        boxes_xyxy=[(10, 10, 60, 60), (100, 100, 160, 160),
+                    (200, 200, 260, 260)],
+        class_id=0, scores=[0.85, 0.80, 0.78])
+    model = _FakeModel(outputs)
+    ident = identify_crop(model, crop)
+    assert ident is not None
+    assert ident['class_id'] == 0
+    assert ident['count'] == 3
 
 
 def test_identify_crop_empty_returns_none():

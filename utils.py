@@ -4,17 +4,21 @@
 import cv2
 import numpy as np
 
-CLASSES = ['Apple', 'Avocado', 'Banana', 'Bell pepper', 'Bread', 'Broccoli',
-           'Butter', 'Carrot', 'Cheese', 'Chicken', 'Cooking cream', 'Eggs',
-           'Garlic', 'Hot Sauce', 'Ketchup', 'Lemon', 'Tomato']
+CLASSES = [
+    'apple', 'Onion', 'banana', 'garlic', 'pear',
+    'orange', 'Capsicum', 'Beet', 'Tomato', 'Cucumber',
+    'carrot', 'Eggplant', 'Cabbage', 'Potato', 'Zucchini',
+    'pineapple', 'Garlic', 'Cauliflower', 'Calabash',
+]
 
 COARSE_MAP = {
-    'Apple': '蔬果', 'Avocado': '蔬果', 'Banana': '蔬果',
-    'Bell pepper': '蔬果', 'Broccoli': '蔬果', 'Carrot': '蔬果',
-    'Garlic': '蔬果', 'Lemon': '蔬果', 'Tomato': '蔬果',
-    'Chicken': '生鲜', 'Eggs': '生鲜',
-    'Butter': '乳品', 'Cheese': '乳品', 'Cooking cream': '乳品',
-    'Bread': '包装食品', 'Hot Sauce': '包装食品', 'Ketchup': '包装食品',
+    'apple': '水果', 'banana': '水果', 'pear': '水果',
+    'orange': '水果', 'pineapple': '水果',
+    'Onion': '蔬菜', 'garlic': '蔬菜', 'Capsicum': '蔬菜',
+    'Beet': '蔬菜', 'Tomato': '蔬菜', 'Cucumber': '蔬菜',
+    'carrot': '蔬菜', 'Eggplant': '蔬菜', 'Cabbage': '蔬菜',
+    'Potato': '蔬菜', 'Zucchini': '蔬菜', 'Garlic': '蔬菜',
+    'Cauliflower': '蔬菜', 'Calabash': '蔬菜',
 }
 
 
@@ -23,8 +27,8 @@ def to_coarse(class_id):
     return COARSE_MAP[CLASSES[class_id]]
 
 
-IMG_SIZE = 416
-CONF_THRESH = 0.30
+IMG_SIZE = 640
+CONF_THRESH = 0.20
 NMS_THRESH = 0.45
 
 
@@ -57,9 +61,9 @@ def preprocess(img):
 def postprocess(outputs, ratio, pad, orig_shape):
     """
     YOLOv8后处理
-    输出格式: (1, 21, 3549, 1)
-    前4行是 x1,y1,x2,y2 (像素坐标, 416尺度)
-    后17行是类别得分
+    输出格式: (1, 23, 8400, 1)
+    前4行是 x1,y1,x2,y2 (像素坐标, 640尺度)
+    后19行是类别得分
     """
     pred = outputs[0]
     if pred.ndim == 4:
@@ -143,10 +147,12 @@ def identify_crop(model, crop_bgr):
     best = int(np.argmax(confs))
     cid = int(class_ids[best])
     x1, y1, x2, y2 = boxes[best]
+    count = int(np.sum(np.asarray(class_ids) == cid))  # 同类目标个数
     return {
         'class_id': cid,
         'fine': CLASSES[cid],
         'coarse': to_coarse(cid),
         'conf': float(confs[best]),
         'area': float(abs((x2 - x1) * (y2 - y1))),
+        'count': count,
     }
