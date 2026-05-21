@@ -17,8 +17,24 @@ from change_locator import find_change_regions, classify_regions
 from event_detector import EventDetector
 from inventory import InventoryManager
 
-RKNN_MODEL = 'models/fridge_yolo_fp16.rknn'
+RKNN_MODEL = 'models/fridge_yolo_v2.rknn'
 CAMERA_ID = 0
+PREVIEW_PATH = '/tmp/fridge_latest.jpg'
+PREVIEW_INTERVAL = 30  # 每30帧保存一次（约1秒）
+
+STATE_COLORS = {
+    'STABLE':   (0, 200, 0),
+    'BUSY':     (0, 140, 255),
+    'SETTLING': (255, 140, 0),
+}
+
+
+def save_preview(frame, state):
+    img = frame.copy()
+    color = STATE_COLORS.get(state, (128, 128, 128))
+    cv2.putText(img, state, (10, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 2, cv2.LINE_AA)
+    cv2.imwrite(PREVIEW_PATH, img)
 
 
 def open_source():
@@ -72,11 +88,17 @@ def main():
     inv = InventoryManager()
 
     def classify_fn(crop):
-        return identify_crop(model, crop)
+        result = identify_crop(model, crop)
+        print(f'[DEBUG] classify → {result}')
+        return result
 
     def locate_fn(ref, new):
         bboxes = find_change_regions(ref, new)
-        return classify_regions(ref, new, bboxes, classify_fn)
+        print(f'[DEBUG] 变化区域: {len(bboxes)} 个, boxes={bboxes}')
+        regions = classify_regions(ref, new, bboxes, classify_fn)
+        for r in regions:
+            print(f'[DEBUG] 区域: kind={r.kind} ref={r.ref_ident} new={r.new_ident}')
+        return regions
 
     detector = EventDetector(is_moving, locate_fn)
     print('✓ 事件检测器就绪')
@@ -101,7 +123,8 @@ def main():
                 inv.process_event(event_type, details)
                 print(f'[事件] {event_type} {details}')
                 inv.print_stock()
-            if frame_count % 30 == 0:
+            if frame_count % PREVIEW_INTERVAL == 0:
+                save_preview(frame, state)
                 print(f'帧{frame_count:5d} | 状态:{state}')
     except KeyboardInterrupt:
         print('\n用户中断')
