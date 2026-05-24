@@ -116,6 +116,39 @@ class InventoryManager:
         self.conn.commit()
         print(f'[库存] 取出: {name} x{qty}')
 
+    def has_stock(self):
+        """DB 里是否已有在库记录（用于判断是否首次启动）"""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM inventory WHERE status='in' AND quantity>0"
+        ).fetchone()
+        return row[0] > 0
+
+    def adjust_quantity(self, class_name, new_qty):
+        """用户手动修正某种食材数量，写 DB + 记事件"""
+        now = self._now()
+        row = self.conn.execute(
+            "SELECT id, quantity, class_id FROM inventory WHERE class_name=? AND status='in'",
+            (class_name,)
+        ).fetchone()
+        if row is None:
+            return False, f'{class_name} 不在库存中'
+        old_qty, cls_id, rec_id = row[1], row[2], row[0]
+        new_qty = max(0, int(new_qty))
+        status = 'out' if new_qty == 0 else 'in'
+        self.conn.execute(
+            "UPDATE inventory SET quantity=?, status=?, last_update=? WHERE id=?",
+            (new_qty, status, now, rec_id)
+        )
+        diff = new_qty - old_qty
+        note = f'用户手动修正：{class_name} {old_qty}→{new_qty}'
+        self.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?,?)",
+            (None, now, 'MANUAL_ADJUST', cls_id, class_name, diff, note)
+        )
+        self.conn.commit()
+        print(f'[库存] 手动修正: {class_name} {old_qty}→{new_qty}')
+        return True, note
+
     def get_current_stock(self):
         """获取当前在库食材"""
         rows = self.conn.execute(

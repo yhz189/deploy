@@ -3,7 +3,7 @@
 访问 http://<板子IP>:5000
 """
 import os
-from flask import Flask, jsonify, render_template_string, send_file
+from flask import Flask, jsonify, render_template_string, send_file, request
 from inventory import InventoryManager
 
 app = Flask(__name__)
@@ -141,6 +141,21 @@ def api_events():
               for t,e,n in inv.get_recent_events(20)]
     inv.close()
     return jsonify(events)
+
+
+@app.route('/api/stock/adjust', methods=['POST'])
+def api_adjust():
+    """用户手动修正库存数量
+    POST JSON: {"name": "banana", "qty": 4}
+    """
+    data = request.get_json(silent=True)
+    if not data or 'name' not in data or 'qty' not in data:
+        return jsonify({'ok': False, 'error': '缺少 name 或 qty 字段'}), 400
+    inv = InventoryManager()
+    ok, msg = inv.adjust_quantity(data['name'], data['qty'])
+    inv.close()
+    return jsonify({'ok': ok, 'msg': msg}), (200 if ok else 404)
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)

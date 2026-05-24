@@ -1,7 +1,13 @@
 """冰箱食材识别与管理系统 - 主程序
 
-实时模式：  python main.py
-回放模式：  python main.py --replay results/clip   （喂帧序列目录调试）
+实时模式：       python main.py
+实时 + 显示窗口： python main.py --show
+回放模式：       python main.py --replay results/clip
+回放 + 显示窗口： python main.py --replay results/clip --show
+
+--show 会在板子接的 HDMI 显示器上开一个实时窗口，叠加显示状态机状态、
+变化区域框、最近事件。窗口里按 q 退出。
+（注意：--show 需在板子本地桌面运行，或 SSH 时加 DISPLAY=:0）
 """
 import os
 import sys
@@ -20,7 +26,10 @@ from inventory import InventoryManager
 RKNN_MODEL = 'models/fridge_yolo_v2.rknn'
 CAMERA_ID = 0
 PREVIEW_PATH = '/tmp/fridge_latest.jpg'
-PREVIEW_INTERVAL = 30  # 每30帧保存一次（约1秒）
+PREVIEW_INTERVAL = 30          # 每30帧保存一次预览（约1秒）
+REGION_SHOW_FRAMES = 90        # 分析结束后变化框持续显示的帧数
+
+SHOW = '--show' in sys.argv    # 是否开实时显示窗口
 
 STATE_COLORS = {
     'STABLE':   (0, 200, 0),
@@ -28,20 +37,69 @@ STATE_COLORS = {
     'SETTLING': (255, 140, 0),
 }
 
+REGION_COLORS = {
+    'APPEAR':    (0, 200, 0),
+    'DISAPPEAR': (0, 0, 255),
+    'REPLACE':   (255, 0, 255),
+    'SAME':      (200, 200, 0),
+    'NOISE':     (130, 130, 130),
+}
 
-def save_preview(frame, state):
+
+def format_event(event_type, details):
+    """事件格式化成 ASCII 字符串（cv2.putText 不支持中文）"""
+    parts = []
+    for key in ('added', 'removed'):
+        for cid, n in details.get(key, {}).items():
+            parts.append(f'{CLASSES[cid]}x{n}')
+    return f"{event_type} {' '.join(parts)}".strip()
+
+
+def draw_overlay(frame, state, frame_count, last_event='', regions=None):
+    """在帧上叠加状态/帧号/事件/变化区域，返回新图（不改原图）"""
     img = frame.copy()
+    if regions:
+        for r in regions:
+            x, y, w, h = r.bbox
+            rc = REGION_COLORS.get(r.kind, (200, 200, 200))
+            cv2.rectangle(img, (x, y), (x + w, y + h), rc, 2)
+            ident = r.new_ident or r.ref_ident
+            label = r.kind if ident is None else f"{r.kind}:{ident['fine']}"
+            cv2.putText(img, label, (x, max(y - 6, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, rc, 1, cv2.LINE_AA)
     color = STATE_COLORS.get(state, (128, 128, 128))
-    cv2.putText(img, state, (10, 35),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 2, cv2.LINE_AA)
+    cv2.putText(img, state, (10, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
+    cv2.putText(img, f'frame {frame_count}', (10, 58),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1, cv2.LINE_AA)
+    if last_event:
+        cv2.putText(img, last_event, (10, img.shape[0] - 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
+                    cv2.LINE_AA)
+    return img
+
+
+def save_preview(frame, state, frame_count=0, last_event=''):
+    """保存预览图给 Web 端 /camera 路由读取"""
+    img = draw_overlay(frame, state, frame_count, last_event)
     cv2.imwrite(PREVIEW_PATH, img)
+
+
+def _replay_dir():
+    """命令行里找 --replay 的目录参数，没有返回 None"""
+    if '--replay' in sys.argv:
+        i = sys.argv.index('--replay')
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
 
 
 def open_source():
     """返回一个逐帧产出 BGR 图的生成器；支持实时摄像头与回放目录"""
-    if len(sys.argv) >= 3 and sys.argv[1] == '--replay':
-        paths = sorted(glob.glob(os.path.join(sys.argv[2], '*.jpg')))
-        assert paths, f'回放目录无 jpg：{sys.argv[2]}'
+    replay = _replay_dir()
+    if replay:
+        paths = sorted(glob.glob(os.path.join(replay, '*.jpg')))
+        assert paths, f'回放目录无 jpg：{replay}'
         for p in paths:
             img = cv2.imread(p)
             if img is not None:
@@ -102,33 +160,64 @@ def main():
 
     detector = EventDetector(is_moving, locate_fn)
     print('✓ 事件检测器就绪')
+    if SHOW:
+        print('✓ 显示窗口已开启（窗口内按 q 退出）')
 
     frames = open_source()
     first = next(frames, None)
     assert first is not None, '无可用帧'
 
     dets = seed_detections(model, first)
-    detector.seed(first, dets)
-    for d in dets:
-        inv.process_event('PUT_IN', {'added': {d['class_id']: 1}})
-    print(f'✓ 开机播种：{len(dets)} 个物品')
+    detector.seed(first, dets)          # 始终恢复位置记忆
+    if inv.has_stock():
+        # 非首次启动：DB 已有库存（可能含用户手动修正）
+        # 只恢复 placed_items 位置记忆，不再写 DB，保护用户数据
+        print(f'✓ 检测到已有库存，跳过 DB 播种，仅恢复位置记忆（{len(dets)} 个检测框）')
+    else:
+        # 首次启动：DB 为空，正常初始化库存
+        for d in dets:
+            inv.process_event('PUT_IN', {'added': {d['class_id']: 1}})
+        print(f'✓ 首次启动播种：{len(dets)} 个物品')
     inv.print_stock()
 
     frame_count = 0
+    prev_state = detector.state
+    last_event_text = ''
+    region_show = 0          # 剩余显示变化框的帧数
     try:
         for frame in frames:
             frame_count += 1
             events, state = detector.update(frame)
             for event_type, details in events:
                 inv.process_event(event_type, details)
+                last_event_text = format_event(event_type, details)
                 print(f'[事件] {event_type} {details}')
                 inv.print_stock()
+
+            # 分析刚结束（SETTLING→STABLE）→ 变化框显示一段时间
+            if prev_state == 'SETTLING' and state == 'STABLE':
+                region_show = REGION_SHOW_FRAMES
+            prev_state = state
+
             if frame_count % PREVIEW_INTERVAL == 0:
-                save_preview(frame, state)
+                save_preview(frame, state, frame_count, last_event_text)
                 print(f'帧{frame_count:5d} | 状态:{state}')
+
+            if SHOW:
+                regions = detector.last_regions if region_show > 0 else None
+                vis = draw_overlay(frame, state, frame_count,
+                                   last_event_text, regions)
+                cv2.imshow('Fridge Monitor', vis)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print('\n窗口退出')
+                    break
+            if region_show > 0:
+                region_show -= 1
     except KeyboardInterrupt:
         print('\n用户中断')
     finally:
+        if SHOW:
+            cv2.destroyAllWindows()
         print('\n====== 最终库存 ======')
         inv.print_stock()
         inv.close()

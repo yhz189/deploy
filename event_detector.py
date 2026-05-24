@@ -43,6 +43,7 @@ class EventDetector:
         self._still_streak = 0
         self._settle_streak = 0
         self._settle_frame = None
+        self.last_regions = []          # 最近一次分析的变化区域，供可视化读取
 
     def seed(self, frame, detections):
         """开机播种：detections 为 [{'class_id','fine','coarse','bbox'}, ...]"""
@@ -105,6 +106,7 @@ class EventDetector:
 
     def _analyze(self, new_frame):
         regions = self.locate_fn(self.ref_frame, new_frame)
+        self.last_regions = regions
         return self._analyze_regions(regions)
 
     def _analyze_regions(self, regions):
