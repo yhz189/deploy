@@ -15,9 +15,13 @@ def test_to_coarse_vegetable():
 
 
 def test_to_coarse_covers_all_classes():
-    # 19 个细类每个都要有粗类映射
+    # 20 个细类每个都要有粗类映射
     for cid in range(len(CLASSES)):
-        assert to_coarse(cid) in ('水果', '蔬菜')
+        assert to_coarse(cid) in ('水果', '蔬菜', '肉蛋生鲜')
+
+
+def test_to_coarse_egg():
+    assert to_coarse(CLASSES.index('egg')) == '肉蛋生鲜'
 
 
 def _make_outputs(boxes_xyxy, class_id, scores):

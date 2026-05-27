@@ -25,7 +25,7 @@ from inventory import InventoryManager
 from package_ocr import (save_package_candidate,
                          save_package_takeout_candidate)
 
-RKNN_MODEL = 'models/fridge_yolo_v2.rknn'
+RKNN_MODEL = 'models/fridge_yolo_v3.rknn'
 CAMERA_ID = 0
 PREVIEW_PATH = '/tmp/fridge_latest.jpg'
 PREVIEW_INTERVAL = 30          # 每30帧保存一次预览（约1秒）

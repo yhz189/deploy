@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 
 
-DEFAULT_MODEL = 'models/fridge_yolo_v2.rknn'
+DEFAULT_MODEL = 'models/fridge_yolo_v3.rknn'
 IMG_SIZE = 640
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 

@@ -19,7 +19,7 @@ from rknnlite.api import RKNNLite
 from utils import CLASSES, draw_results, postprocess, preprocess
 
 
-DEFAULT_MODEL = 'models/fridge_yolo_v2.rknn'
+DEFAULT_MODEL = 'models/fridge_yolo_v3.rknn'
 
 
 def _parse_crop(text):

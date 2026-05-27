@@ -8,7 +8,7 @@ CLASSES = [
     'apple', 'Onion', 'banana', 'garlic', 'pear',
     'orange', 'Capsicum', 'Beet', 'Tomato', 'Cucumber',
     'carrot', 'Eggplant', 'Cabbage', 'Potato', 'Zucchini',
-    'pineapple', 'Garlic', 'Cauliflower', 'Calabash',
+    'pineapple', 'Garlic', 'Cauliflower', 'Calabash', 'egg',
 ]
 
 COARSE_MAP = {
@@ -19,6 +19,7 @@ COARSE_MAP = {
     'carrot': '蔬菜', 'Eggplant': '蔬菜', 'Cabbage': '蔬菜',
     'Potato': '蔬菜', 'Zucchini': '蔬菜', 'Garlic': '蔬菜',
     'Cauliflower': '蔬菜', 'Calabash': '蔬菜',
+    'egg': '肉蛋生鲜',
 }
 
 
@@ -61,18 +62,18 @@ def preprocess(img):
 def postprocess(outputs, ratio, pad, orig_shape):
     """
     YOLOv8后处理
-    输出格式: (1, 23, 8400, 1)
+    输出格式: (1, 24, 8400, 1)
     前4行是 x1,y1,x2,y2 (像素坐标, 640尺度)
-    后19行是类别得分
+    后20行是类别得分
     """
     pred = outputs[0]
     if pred.ndim == 4:
         pred = pred[:, :, :, 0]
-    pred = pred[0]     # (21, 3549)
-    pred = pred.T      # (3549, 21)
+    pred = pred[0]
+    pred = pred.T
 
     boxes_xyxy = pred[:, :4]       # 已经是x1y1x2y2
-    cls_scores = pred[:, 4:]       # 17类得分
+    cls_scores = pred[:, 4:]
 
     class_ids = np.argmax(cls_scores, axis=1)
     confidences = np.max(cls_scores, axis=1)
