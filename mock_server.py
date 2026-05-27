@@ -32,11 +32,22 @@ app = Flask(__name__)
 
 _INITIAL_STOCK = [
     {"name": "banana", "qty": 2, "first_in": "2026-05-20 23:21:09",
-     "last_update": "2026-05-21 09:30:15"},
+     "last_update": "2026-05-21 09:30:15", "type": "fresh",
+     "source": "mock", "expire_date": None, "category": "生鲜食材",
+     "shelf_id": "single", "days_to_expire": None, "expire_status": "none"},
     {"name": "apple", "qty": 3, "first_in": "2026-05-21 08:00:00",
-     "last_update": "2026-05-21 08:00:00"},
+     "last_update": "2026-05-21 08:00:00", "type": "fresh",
+     "source": "mock", "expire_date": None, "category": "生鲜食材",
+     "shelf_id": "single", "days_to_expire": None, "expire_status": "none"},
     {"name": "Tomato", "qty": 1, "first_in": "2026-05-21 09:15:30",
-     "last_update": "2026-05-21 09:15:30"},
+     "last_update": "2026-05-21 09:15:30", "type": "fresh",
+     "source": "mock", "expire_date": None, "category": "生鲜食材",
+     "shelf_id": "single", "days_to_expire": None, "expire_status": "none"},
+    {"name": "纯牛奶", "qty": 1, "first_in": "2026-05-21 10:10:00",
+     "last_update": "2026-05-21 10:10:00", "type": "package",
+     "source": "phone_ocr", "expire_date": "2026-06-01",
+     "category": "饮料乳品", "shelf_id": "single",
+     "days_to_expire": 7, "expire_status": "normal"},
 ]
 
 _INITIAL_EVENTS = [
@@ -51,6 +62,27 @@ _INITIAL_EVENTS = [
 
 MOCK_STOCK = copy.deepcopy(_INITIAL_STOCK)
 MOCK_EVENTS = copy.deepcopy(_INITIAL_EVENTS)
+MOCK_PACKAGE_CANDIDATE = {
+    "ok": False,
+    "name": "",
+    "confidence": 0.0,
+    "engine": "phone_ocr",
+    "raw_text": [],
+    "error": "pending phone OCR",
+    "bbox": [120, 90, 260, 180],
+    "time": "2026-05-21 10:10:00",
+    "image_url": "/package/candidate/image",
+}
+MOCK_PACKAGE_TAKEOUT_CANDIDATE = {
+    "ok": False,
+    "engine": "phone_ocr",
+    "error": "pending phone OCR",
+    "bbox": [120, 90, 260, 180],
+    "reason": "mock package text disappeared",
+    "time": "2026-05-21 10:20:00",
+    "ref_image_url": "/package/takeout/ref_image",
+    "new_image_url": "/package/takeout/new_image",
+}
 
 
 def _apply_to_stock(etype, food, n):
@@ -63,7 +95,12 @@ def _apply_to_stock(etype, food, n):
             item['last_update'] = now
         else:
             MOCK_STOCK.append({'name': food, 'qty': n,
-                               'first_in': now, 'last_update': now})
+                               'first_in': now, 'last_update': now,
+                               'type': 'fresh', 'source': 'mock',
+                               'expire_date': None, 'category': '生鲜食材',
+                               'shelf_id': 'single',
+                               'days_to_expire': None,
+                               'expire_status': 'none'})
     elif etype in ('TAKE_OUT', 'PARTIAL_TAKE_OUT'):
         if item:
             item['qty'] -= n
@@ -95,6 +132,59 @@ def camera():
                 (110, 285), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (100, 100, 100), 2)
     cv2.putText(img, 'State: STABLE', (210, 335),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 180, 0), 2)
+    ok, buf = cv2.imencode('.jpg', img)
+    return Response(buf.tobytes(), mimetype='image/jpeg')
+
+
+@app.route('/api/package/candidate')
+def api_package_candidate():
+    """模拟疑似包装物品裁剪图，App 端拿图后做 OCR。"""
+    return jsonify(MOCK_PACKAGE_CANDIDATE)
+
+
+@app.route('/package/candidate/image')
+def package_candidate_image():
+    """返回一张模拟包装裁剪图。"""
+    img = np.full((260, 420, 3), 245, dtype=np.uint8)
+    cv2.rectangle(img, (25, 30), (395, 230), (40, 120, 220), 3)
+    cv2.putText(img, 'PACKAGE OCR', (70, 85),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 80, 80), 2)
+    cv2.putText(img, 'Milk 250ml', (80, 150),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (30, 30, 30), 3)
+    cv2.putText(img, 'name: pure milk', (85, 195),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (90, 90, 90), 2)
+    ok, buf = cv2.imencode('.jpg', img)
+    return Response(buf.tobytes(), mimetype='image/jpeg')
+
+
+@app.route('/api/package/takeout_candidate')
+def api_package_takeout_candidate():
+    """模拟疑似包装取出的前后裁剪图，App 端拿图后做 OCR。"""
+    return jsonify(MOCK_PACKAGE_TAKEOUT_CANDIDATE)
+
+
+@app.route('/package/takeout/ref_image')
+def package_takeout_ref_image():
+    """模拟取出前：裁剪图里有包装文字。"""
+    img = np.full((260, 420, 3), 245, dtype=np.uint8)
+    cv2.rectangle(img, (25, 30), (395, 230), (45, 80, 210), 3)
+    cv2.putText(img, 'HOT POT', (105, 95),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (30, 30, 30), 3)
+    cv2.putText(img, 'soup base', (95, 155),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (40, 40, 40), 2)
+    cv2.putText(img, 'takeout ref', (105, 205),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (90, 90, 90), 2)
+    ok, buf = cv2.imencode('.jpg', img)
+    return Response(buf.tobytes(), mimetype='image/jpeg')
+
+
+@app.route('/package/takeout/new_image')
+def package_takeout_new_image():
+    """模拟取出后：裁剪图里只剩空背景。"""
+    img = np.full((260, 420, 3), 225, dtype=np.uint8)
+    cv2.rectangle(img, (25, 30), (395, 230), (190, 190, 190), 2)
+    cv2.putText(img, 'EMPTY AREA', (110, 145),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (130, 130, 130), 2)
     ok, buf = cv2.imencode('.jpg', img)
     return Response(buf.tobytes(), mimetype='image/jpeg')
 
@@ -150,6 +240,128 @@ def api_adjust():
     return jsonify({'ok': True, 'msg': f'{name} {old_qty}→{new_qty}'})
 
 
+@app.route('/api/package/confirm', methods=['POST'])
+def api_package_confirm():
+    """手机端 OCR 后提交包装物品入库
+    POST JSON: {"name": "纯牛奶", "qty": 1}
+    """
+    data = request.get_json(silent=True)
+    if not data or 'name' not in data:
+        return jsonify({'ok': False, 'error': '缺少 name 字段'}), 400
+    name = data['name'].strip()
+    qty = max(1, int(data.get('qty', 1)))
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    item = next((s for s in MOCK_STOCK
+                 if s['name'] == name and s.get('type') == 'package'), None)
+    if item:
+        item['qty'] += qty
+        item['last_update'] = now
+        item['source'] = data.get('source', 'phone_ocr')
+    else:
+        MOCK_STOCK.append({
+            "name": name, "qty": qty, "first_in": now, "last_update": now,
+            "type": "package", "source": data.get('source', 'phone_ocr'),
+            "expire_date": data.get('expire_date'),
+            "category": data.get('category', '包装食品'),
+            "shelf_id": data.get('shelf_id', 'single'),
+            "days_to_expire": None,
+            "expire_status": "none",
+        })
+    note = f'包装物品入库：{name} x{qty}'
+    MOCK_EVENTS.insert(0, {"time": now, "type": "PACKAGE_PUT_IN",
+                           "note": note})
+    return jsonify({'ok': True, 'msg': note, 'stock': MOCK_STOCK})
+
+
+@app.route('/api/package/adjust', methods=['POST'])
+def api_package_adjust():
+    """修改包装物品名称和数量
+    POST JSON: {"old_name": "纯牛奶", "name": "蒙牛纯牛奶", "qty": 2}
+    """
+    data = request.get_json(silent=True)
+    if not data or 'qty' not in data:
+        return jsonify({'ok': False, 'error': '缺少 qty 字段'}), 400
+    old_name = (data.get('old_name') or data.get('name') or '').strip()
+    new_name = (data.get('name') or old_name).strip()
+    qty = max(0, int(data['qty']))
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    item = next((s for s in MOCK_STOCK
+                 if s['name'] == old_name and s.get('type') == 'package'), None)
+    if item is None:
+        return jsonify({'ok': False,
+                        'error': f'{old_name} 不在包装物品库存中'}), 404
+    old_qty = item['qty']
+    item['name'] = new_name
+    item['qty'] = qty
+    item['last_update'] = now
+    item['source'] = 'manual'
+    item['expire_date'] = data.get('expire_date', item.get('expire_date'))
+    item['category'] = data.get('category', item.get('category', '包装食品'))
+    item['shelf_id'] = data.get('shelf_id', item.get('shelf_id', 'single'))
+    if qty == 0:
+        MOCK_STOCK.remove(item)
+    note = f'用户修正包装物品：{old_name} {old_qty}→{new_name} {qty}'
+    MOCK_EVENTS.insert(0, {"time": now, "type": "PACKAGE_MANUAL_ADJUST",
+                           "note": note})
+    return jsonify({'ok': True, 'msg': note, 'stock': MOCK_STOCK})
+
+
+@app.route('/api/cloud/confirm', methods=['POST'])
+def api_cloud_confirm():
+    """模拟云端兜底识别结果写回。"""
+    data = request.get_json(silent=True)
+    if not data or 'name' not in data:
+        return jsonify({'ok': False, 'error': '缺少 name 字段'}), 400
+    name = data['name'].strip()
+    qty = max(1, int(data.get('qty', 1)))
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    item_type = data.get('item_type', 'package')
+    item = next((s for s in MOCK_STOCK
+                 if s['name'] == name and s.get('type') == item_type), None)
+    if item:
+        item['qty'] += qty
+        item['last_update'] = now
+        item['source'] = 'cloud'
+    else:
+        MOCK_STOCK.append({
+            "name": name, "qty": qty, "first_in": now, "last_update": now,
+            "type": item_type, "source": "cloud",
+            "expire_date": data.get('expire_date'),
+            "category": data.get('category', '云端识别'),
+            "shelf_id": data.get('shelf_id', 'single'),
+            "days_to_expire": None,
+            "expire_status": "none",
+        })
+    note = f'云端识别入库：{name} x{qty}'
+    MOCK_EVENTS.insert(0, {"time": now, "type": "CLOUD_PUT_IN",
+                           "note": note})
+    return jsonify({'ok': True, 'msg': note, 'stock': MOCK_STOCK})
+
+
+@app.route('/api/package/takeout', methods=['POST'])
+def api_package_takeout():
+    """手机端 OCR 判断包装物品被取出后提交出库
+    POST JSON: {"name": "纯牛奶", "qty": 1}
+    """
+    data = request.get_json(silent=True)
+    if not data or 'name' not in data:
+        return jsonify({'ok': False, 'error': '缺少 name 字段'}), 400
+    name = data['name'].strip()
+    qty = max(1, int(data.get('qty', 1)))
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    item = next((s for s in MOCK_STOCK
+                 if s['name'] == name and s.get('type') == 'package'), None)
+    if item:
+        item['qty'] -= qty
+        item['last_update'] = now
+        if item['qty'] <= 0:
+            MOCK_STOCK.remove(item)
+    note = f'取出包装物品{name} x{qty}'
+    MOCK_EVENTS.insert(0, {"time": now, "type": "PACKAGE_TAKE_OUT",
+                           "note": note})
+    return jsonify({'ok': True, 'msg': note, 'stock': MOCK_STOCK})
+
+
 @app.route('/dev/reset')
 def dev_reset():
     """开发用：库存和事件都恢复到初始基线"""
@@ -166,6 +378,17 @@ def index():
             '<li><a href="/api/stock">/api/stock</a> — 当前库存</li>'
             '<li><a href="/api/events">/api/events</a> — 事件列表</li>'
             '<li><a href="/camera">/camera</a> — 占位摄像头</li>'
+            '<li><a href="/api/package/candidate">/api/package/candidate</a>'
+            ' — 最近包装裁剪图</li>'
+            '<li><a href="/package/candidate/image">/package/candidate/image</a>'
+            ' — 包装裁剪图</li>'
+            '<li><a href="/api/package/takeout_candidate">/api/package/takeout_candidate</a>'
+            ' — 包装取出候选</li>'
+            '<li><a href="/package/takeout/ref_image">/package/takeout/ref_image</a>'
+            ' — 取出前裁剪图</li>'
+            '<li><a href="/package/takeout/new_image">/package/takeout/new_image</a>'
+            ' — 取出后裁剪图</li>'
+            '<li>POST /api/cloud/confirm — 云端兜底识别结果写回</li>'
             '<li><a href="/dev/add_event/PUT_IN/apple">放入1个apple</a>'
             '（同时更新库存与事件）</li>'
             '<li><a href="/dev/add_event/PUT_IN/apple?n=3">放入3个apple</a></li>'

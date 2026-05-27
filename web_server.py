@@ -5,6 +5,12 @@
 import os
 from flask import Flask, jsonify, render_template_string, send_file, request
 from inventory import InventoryManager
+from utils import CLASSES
+from package_ocr import (
+    PACKAGE_CROP_PATH, PACKAGE_TAKEOUT_NEW_PATH, PACKAGE_TAKEOUT_REF_PATH,
+    clear_package_candidate, clear_package_takeout_candidate,
+    load_package_candidate, load_package_takeout_candidate,
+)
 
 app = Flask(__name__)
 
@@ -50,13 +56,14 @@ HTML = '''
         <h2>📦 当前库存</h2>
         {% if stock %}
         <table>
-            <tr><th>食材</th><th>数量</th><th>入库时间</th><th>最后更新</th></tr>
-            {% for name, qty, first_in, last_update in stock %}
+            <tr><th>名称</th><th>类型</th><th>数量</th><th>入库时间</th><th>最后更新</th></tr>
+            {% for item in stock %}
             <tr>
-                <td>{{ name }}</td>
-                <td><span class="badge">{{ qty }} 个</span></td>
-                <td class="time">{{ first_in }}</td>
-                <td class="time">{{ last_update }}</td>
+                <td>{{ item.name }}</td>
+                <td>{{ '包装物品' if item.type == 'package' else '生鲜食材' }}</td>
+                <td><span class="badge">{{ item.qty }} 个</span></td>
+                <td class="time">{{ item.first_in }}</td>
+                <td class="time">{{ item.last_update }}</td>
             </tr>
             {% endfor %}
         </table>
@@ -113,7 +120,7 @@ HTML = '''
 @app.route('/')
 def index():
     inv = InventoryManager()
-    stock = inv.get_current_stock()
+    stock = inv.get_current_stock_records()
     events = inv.get_recent_events(20)
     inv.close()
     return render_template_string(HTML, stock=stock, events=events)
@@ -129,8 +136,7 @@ def camera():
 @app.route('/api/stock')
 def api_stock():
     inv = InventoryManager()
-    stock = [{'name':n,'qty':q,'first_in':f,'last_update':l}
-             for n,q,f,l in inv.get_current_stock()]
+    stock = inv.get_current_stock_records()
     inv.close()
     return jsonify(stock)
 
@@ -155,6 +161,148 @@ def api_adjust():
     ok, msg = inv.adjust_quantity(data['name'], data['qty'])
     inv.close()
     return jsonify({'ok': ok, 'msg': msg}), (200 if ok else 404)
+
+
+@app.route('/api/package/candidate')
+def api_package_candidate():
+    """返回最近一次疑似包装物品裁剪图，供 App 做本地 OCR。"""
+    cand = load_package_candidate()
+    if cand is None:
+        return jsonify({'ok': False, 'error': '暂无包装候选'}), 404
+    return jsonify(cand)
+
+
+@app.route('/package/candidate/image')
+def package_candidate_image():
+    """返回最近一次包装变化区域裁剪图。"""
+    if not os.path.exists(PACKAGE_CROP_PATH):
+        return '暂无包装裁剪图', 204
+    return send_file(PACKAGE_CROP_PATH, mimetype='image/jpeg')
+
+
+@app.route('/api/package/confirm', methods=['POST'])
+def api_package_confirm():
+    """手机端 OCR 后提交包装物品入库
+    POST JSON: {"name": "纯牛奶", "qty": 1}
+    """
+    data = request.get_json(silent=True)
+    if not data or 'name' not in data:
+        return jsonify({'ok': False, 'error': '缺少 name 字段'}), 400
+    qty = data.get('qty', 1)
+    cand = load_package_candidate() or {}
+    bbox = data.get('bbox') or cand.get('bbox')
+    source = data.get('source') or 'phone_ocr'
+    inv = InventoryManager()
+    ok, msg = inv.put_package(
+        data['name'], qty, source=source, bbox=bbox,
+        expire_date=data.get('expire_date'), category=data.get('category'),
+        shelf_id=data.get('shelf_id'))
+    inv.close()
+    if ok:
+        clear_package_candidate()
+    return jsonify({'ok': ok, 'msg': msg}), (200 if ok else 400)
+
+
+@app.route('/api/package/adjust', methods=['POST'])
+def api_package_adjust():
+    """修改包装物品名称和数量
+    POST JSON: {"old_name": "纯牛奶", "name": "蒙牛纯牛奶", "qty": 2}
+    """
+    data = request.get_json(silent=True)
+    if not data or 'qty' not in data:
+        return jsonify({'ok': False, 'error': '缺少 qty 字段'}), 400
+    old_name = data.get('old_name') or data.get('name')
+    new_name = data.get('name') or old_name
+    inv = InventoryManager()
+    ok, msg = inv.adjust_package(
+        old_name, new_name, data['qty'],
+        expire_date=data.get('expire_date'), category=data.get('category'),
+        shelf_id=data.get('shelf_id'))
+    inv.close()
+    return jsonify({'ok': ok, 'msg': msg}), (200 if ok else 404)
+
+
+@app.route('/api/cloud/confirm', methods=['POST'])
+def api_cloud_confirm():
+    """App/云端识别兜底结果写回
+    POST JSON: {"name": "牛奶", "qty": 1, "item_type": "package"}
+    """
+    data = request.get_json(silent=True)
+    if not data or 'name' not in data:
+        return jsonify({'ok': False, 'error': '缺少 name 字段'}), 400
+    item_type = data.get('item_type', 'package')
+    qty = max(1, int(data.get('qty', 1)))
+    inv = InventoryManager()
+    if item_type == 'fresh':
+        try:
+            cid = next(i for i, name in enumerate(CLASSES)
+                       if name == data['name'])
+        except StopIteration:
+            cid = None
+        if cid is not None:
+            inv.process_event('PUT_IN', {'added': {cid: qty}})
+            ok, msg = True, f'云端识别生鲜入库：{data["name"]} x{qty}'
+        else:
+            ok, msg = inv.put_package(
+                data['name'], qty, source='cloud',
+                expire_date=data.get('expire_date'),
+                category=data.get('category') or '云端识别',
+                shelf_id=data.get('shelf_id'))
+    else:
+        cand = load_package_candidate() or {}
+        bbox = data.get('bbox') or cand.get('bbox')
+        ok, msg = inv.put_package(
+            data['name'], qty, source='cloud', bbox=bbox,
+            expire_date=data.get('expire_date'),
+            category=data.get('category') or '包装食品',
+            shelf_id=data.get('shelf_id'))
+    inv.close()
+    if ok:
+        clear_package_candidate()
+    return jsonify({'ok': ok, 'msg': msg}), (200 if ok else 400)
+
+
+@app.route('/api/package/takeout_candidate')
+def api_package_takeout_candidate():
+    """返回最近一次疑似包装取出的前后裁剪图信息，供 App OCR 判断。"""
+    cand = load_package_takeout_candidate()
+    if cand is None:
+        return jsonify({'ok': False, 'error': '暂无包装取出候选'}), 404
+    return jsonify(cand)
+
+
+@app.route('/package/takeout/ref_image')
+def package_takeout_ref_image():
+    """返回疑似包装取出前的裁剪图。"""
+    if not os.path.exists(PACKAGE_TAKEOUT_REF_PATH):
+        return '暂无包装取出前裁剪图', 204
+    return send_file(PACKAGE_TAKEOUT_REF_PATH, mimetype='image/jpeg')
+
+
+@app.route('/package/takeout/new_image')
+def package_takeout_new_image():
+    """返回疑似包装取出后的裁剪图。"""
+    if not os.path.exists(PACKAGE_TAKEOUT_NEW_PATH):
+        return '暂无包装取出后裁剪图', 204
+    return send_file(PACKAGE_TAKEOUT_NEW_PATH, mimetype='image/jpeg')
+
+
+@app.route('/api/package/takeout', methods=['POST'])
+def api_package_takeout():
+    """手机端 OCR 判断包装物品被取出后提交出库
+    POST JSON: {"name": "火锅底料", "qty": 1}
+    """
+    data = request.get_json(silent=True)
+    if not data or 'name' not in data:
+        return jsonify({'ok': False, 'error': '缺少 name 字段'}), 400
+    qty = max(1, int(data.get('qty', 1)))
+    inv = InventoryManager()
+    inv.process_event('PACKAGE_TAKE_OUT',
+                      {'removed_package': {data['name']: qty}})
+    inv.close()
+    clear_package_takeout_candidate()
+    return jsonify({'ok': True,
+                    'msg': f'包装物品取出：{data["name"]} x{qty}'})
 
 
 if __name__ == '__main__':

@@ -122,3 +122,13 @@ def test_take_out_falls_back_to_ref_ident_when_memory_misses():
     region = ChangedRegion((10, 10, 40, 40), 'DISAPPEAR', apple, None)
     events = det._analyze_regions([region])
     assert events == [('TAKE_OUT', {'removed': {0: 1}})]
+
+
+def test_package_disappear_emits_package_take_out():
+    det = EventDetector(_fake_motion, None)
+    det.seed(STILL, [])
+    region = ChangedRegion((10, 10, 40, 40), 'PACKAGE_DISAPPEAR',
+                           {'name': '纯牛奶'}, None)
+    events = det._analyze_regions([region])
+    assert events == [('PACKAGE_TAKE_OUT',
+                       {'removed_package': {'纯牛奶': 1}})]

@@ -22,12 +22,15 @@ from motion import is_moving
 from change_locator import find_change_regions, classify_regions
 from event_detector import EventDetector
 from inventory import InventoryManager
+from package_ocr import (save_package_candidate,
+                         save_package_takeout_candidate)
 
 RKNN_MODEL = 'models/fridge_yolo_v2.rknn'
 CAMERA_ID = 0
 PREVIEW_PATH = '/tmp/fridge_latest.jpg'
 PREVIEW_INTERVAL = 30          # 每30帧保存一次预览（约1秒）
 REGION_SHOW_FRAMES = 90        # 分析结束后变化框持续显示的帧数
+PACKAGE_OCR_CONF_TRIGGER = 0.35  # YOLO 低置信度时尝试 OCR 辅助包装建档
 
 SHOW = '--show' in sys.argv    # 是否开实时显示窗口
 
@@ -64,7 +67,9 @@ def draw_overlay(frame, state, frame_count, last_event='', regions=None):
             rc = REGION_COLORS.get(r.kind, (200, 200, 200))
             cv2.rectangle(img, (x, y), (x + w, y + h), rc, 2)
             ident = r.new_ident or r.ref_ident
-            label = r.kind if ident is None else f"{r.kind}:{ident['fine']}"
+            ident_name = None if ident is None else (
+                ident.get('fine') or ident.get('name') or ident.get('category'))
+            label = r.kind if not ident_name else f'{r.kind}:{ident_name}'
             cv2.putText(img, label, (x, max(y - 6, 12)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, rc, 1, cv2.LINE_AA)
     color = STATE_COLORS.get(state, (128, 128, 128))
@@ -83,6 +88,67 @@ def save_preview(frame, state, frame_count=0, last_event=''):
     """保存预览图给 Web 端 /camera 路由读取"""
     img = draw_overlay(frame, state, frame_count, last_event)
     cv2.imwrite(PREVIEW_PATH, img)
+
+
+def maybe_save_package_candidate(new_frame, regions):
+    """保存疑似包装物品裁剪图，交给手机 App 做本地 OCR。"""
+    candidates = []
+    for r in regions:
+        if r.kind == 'NOISE':
+            candidates.append(r)
+        elif r.kind == 'APPEAR' and r.new_ident is not None:
+            if r.new_ident.get('conf', 1.0) < PACKAGE_OCR_CONF_TRIGGER:
+                candidates.append(r)
+    if not candidates:
+        return None
+
+    # 选最大变化区域做 OCR，避免一帧内对多个小噪声重复识别。
+    region = max(candidates, key=lambda rr: rr.bbox[2] * rr.bbox[3])
+    x, y, w, h = region.bbox
+    crop = new_frame[y:y + h, x:x + w]
+    result = {
+        'ok': False,
+        'engine': 'phone_ocr',
+        'error': 'pending phone OCR',
+        'name': '',
+        'confidence': 0.0,
+        'raw_text': [],
+    }
+    cand = save_package_candidate(crop, result, bbox=region.bbox)
+    # 低置信度 APPEAR 更可能是包装/非训练类物品，避免误入普通生鲜库存。
+    if region.kind == 'APPEAR':
+        region.kind = 'NOISE'
+    print('[OCR] 已保存疑似包装裁剪图，等待手机端 OCR 后提交入库')
+    return cand
+
+
+def maybe_save_package_takeout_candidate(ref_frame, new_frame, regions):
+    """保存非生鲜变化区域的前后裁剪图，供手机 OCR 判断包装取出。"""
+    candidates = [r for r in regions if r.kind == 'NOISE']
+    if not candidates:
+        return None
+
+    region = max(candidates, key=lambda rr: rr.bbox[2] * rr.bbox[3])
+    x, y, w, h = region.bbox
+    ref_crop = ref_frame[y:y + h, x:x + w]
+    new_crop = new_frame[y:y + h, x:x + w]
+    cand = save_package_takeout_candidate(
+        ref_crop, new_crop, bbox=region.bbox, reason='noise_region')
+    if cand is not None:
+        print('[OCR] 已保存包装取出候选前后图，等待手机端 OCR 判断')
+    return cand
+
+
+def mark_package_take_out(regions, inv):
+    """把与已入库包装物品位置重合的 NOISE 区域标成包装取出事件。"""
+    for r in regions:
+        if r.kind != 'NOISE':
+            continue
+        match = inv.match_package_by_bbox(r.bbox)
+        if match is not None:
+            r.kind = 'PACKAGE_DISAPPEAR'
+            r.ref_ident = {'name': match['name'], 'bbox': match['bbox']}
+            print(f"[包装取出] 匹配到 {match['name']} bbox={match['bbox']}")
 
 
 def _replay_dir():
@@ -156,6 +222,9 @@ def main():
         regions = classify_regions(ref, new, bboxes, classify_fn)
         for r in regions:
             print(f'[DEBUG] 区域: kind={r.kind} ref={r.ref_ident} new={r.new_ident}')
+        mark_package_take_out(regions, inv)
+        maybe_save_package_takeout_candidate(ref, new, regions)
+        maybe_save_package_candidate(new, regions)
         return regions
 
     detector = EventDetector(is_moving, locate_fn)

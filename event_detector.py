@@ -127,6 +127,11 @@ class EventDetector:
                 if rec is not None:
                     self.placed_items.remove(rec)
                     events.append(('TAKE_OUT', {'removed': {rec['class_id']: 1}}))
+            elif r.kind == 'PACKAGE_DISAPPEAR':
+                name = r.ref_ident.get('name')
+                if name:
+                    events.append(('PACKAGE_TAKE_OUT',
+                                   {'removed_package': {name: 1}}))
         events += self._cross_check(appears, disappears)
         return events
 

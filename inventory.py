@@ -3,9 +3,22 @@
 """
 import sqlite3
 import time
+from datetime import date, datetime
 from utils import CLASSES
 
 DB_PATH = 'inventory.db'
+PACKAGE_IOU_THRESH = 0.25
+
+
+def _iou(b1, b2):
+    x1, y1, w1, h1 = b1
+    x2, y2, w2, h2 = b2
+    ix1, iy1 = max(x1, x2), max(y1, y2)
+    ix2, iy2 = min(x1 + w1, x2 + w2), min(y1 + h1, y2 + h2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    union = w1 * h1 + w2 * h2 - inter
+    return inter / union if union > 0 else 0.0
 
 
 class InventoryManager:
@@ -23,7 +36,9 @@ class InventoryManager:
                 quantity INTEGER DEFAULT 1,
                 first_in TEXT,
                 last_update TEXT,
-                status TEXT DEFAULT 'in'
+                status TEXT DEFAULT 'in',
+                item_type TEXT DEFAULT 'fresh',
+                source TEXT DEFAULT 'yolo'
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -36,7 +51,26 @@ class InventoryManager:
                 note TEXT
             );
         ''')
+        self._ensure_column('inventory', 'item_type',
+                            "TEXT DEFAULT 'fresh'")
+        self._ensure_column('inventory', 'source',
+                            "TEXT DEFAULT 'yolo'")
+        self._ensure_column('inventory', 'bbox_x', 'INTEGER')
+        self._ensure_column('inventory', 'bbox_y', 'INTEGER')
+        self._ensure_column('inventory', 'bbox_w', 'INTEGER')
+        self._ensure_column('inventory', 'bbox_h', 'INTEGER')
+        self._ensure_column('inventory', 'expire_date', 'TEXT')
+        self._ensure_column('inventory', 'category', 'TEXT')
+        self._ensure_column('inventory', 'shelf_id',
+                            "TEXT DEFAULT 'single'")
         self.conn.commit()
+
+    def _ensure_column(self, table, column, ddl):
+        cols = [row[1] for row in self.conn.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchall()]
+        if column not in cols:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def _now(self):
         return time.strftime('%Y-%m-%d %H:%M:%S')
@@ -56,6 +90,10 @@ class InventoryManager:
             for cls_id, qty in details.get('removed', {}).items():
                 self._take_out(cls_id, qty, now, event_type)
 
+        elif event_type == 'PACKAGE_TAKE_OUT':
+            for name, qty in details.get('removed_package', {}).items():
+                self._take_out_package(name, qty, now)
+
         elif event_type == 'EXCHANGE':
             for cls_id, qty in details.get('added', {}).items():
                 self._put_in(cls_id, qty, now)
@@ -66,7 +104,7 @@ class InventoryManager:
         name = CLASSES[cls_id]
         # 检查是否已有该食材在库
         row = self.conn.execute(
-            "SELECT id, quantity FROM inventory WHERE class_id=? AND status='in'",
+            "SELECT id, quantity FROM inventory WHERE class_id=? AND status='in' AND item_type='fresh'",
             (cls_id,)
         ).fetchone()
 
@@ -79,7 +117,7 @@ class InventoryManager:
         else:
             # 新增记录
             self.conn.execute(
-                "INSERT INTO inventory (class_id,class_name,quantity,first_in,last_update,status) VALUES (?,?,?,?,?,'in')",
+                "INSERT INTO inventory (class_id,class_name,quantity,first_in,last_update,status,item_type,source) VALUES (?,?,?,?,?,'in','fresh','yolo')",
                 (cls_id, name, qty, now, now)
             )
 
@@ -89,6 +127,151 @@ class InventoryManager:
         )
         self.conn.commit()
         print(f'[库存] 放入: {name} x{qty}')
+
+    def put_package(self, name, qty=1, source='ocr', bbox=None,
+                    expire_date=None, category='包装食品', shelf_id='single'):
+        """包装物品入库：名称来自 OCR 或用户确认，不依赖 YOLO class_id。"""
+        name = (name or '').strip()
+        if not name:
+            return False, '包装物品名称不能为空'
+        qty = max(1, int(qty))
+        now = self._now()
+        bx, by, bw, bh = self._normalize_bbox(bbox)
+        expire_date = self._normalize_date(expire_date)
+        category = (category or '包装食品').strip()
+        shelf_id = (shelf_id or 'single').strip()
+        row = self.conn.execute(
+            "SELECT id, quantity FROM inventory WHERE class_name=? AND status='in' AND item_type='package'",
+            (name,)
+        ).fetchone()
+        if row:
+            if bbox is None:
+                self.conn.execute(
+                    "UPDATE inventory SET quantity=?, last_update=?, source=?, expire_date=?, category=?, shelf_id=? WHERE id=?",
+                    (row[1] + qty, now, source, expire_date, category,
+                     shelf_id, row[0])
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE inventory SET quantity=?, last_update=?, source=?, bbox_x=?, bbox_y=?, bbox_w=?, bbox_h=?, expire_date=?, category=?, shelf_id=? WHERE id=?",
+                    (row[1] + qty, now, source, bx, by, bw, bh, expire_date,
+                     category, shelf_id, row[0])
+                )
+        else:
+            self.conn.execute(
+                "INSERT INTO inventory (class_id,class_name,quantity,first_in,last_update,status,item_type,source,bbox_x,bbox_y,bbox_w,bbox_h,expire_date,category,shelf_id) VALUES (-1,?,?,?,?, 'in','package',?,?,?,?,?,?,?,?)",
+                (name, qty, now, now, source, bx, by, bw, bh, expire_date,
+                 category, shelf_id)
+            )
+        note = f'包装物品入库：{name} x{qty}'
+        self.conn.execute(
+            "INSERT INTO events (event_time,event_type,class_id,class_name,quantity_change,note) VALUES (?,?,?,?,?,?)",
+            (now, 'PACKAGE_PUT_IN', -1, name, qty, note)
+        )
+        self.conn.commit()
+        print(f'[库存] 包装物品入库: {name} x{qty}')
+        return True, note
+
+    def _normalize_bbox(self, bbox):
+        if bbox is None:
+            return None, None, None, None
+        x, y, w, h = bbox
+        return int(x), int(y), int(w), int(h)
+
+    def _normalize_date(self, value):
+        if value in (None, ''):
+            return None
+        value = str(value).strip()
+        try:
+            datetime.strptime(value, '%Y-%m-%d')
+            return value
+        except ValueError:
+            return None
+
+    def get_package_locations(self):
+        """返回带位置记忆的包装物品，用于主程序匹配取出。"""
+        rows = self.conn.execute(
+            "SELECT class_name, quantity, bbox_x, bbox_y, bbox_w, bbox_h FROM inventory WHERE status='in' AND item_type='package' AND quantity>0 AND bbox_x IS NOT NULL"
+        ).fetchall()
+        return [
+            {'name': n, 'qty': q, 'bbox': (int(x), int(y), int(w), int(h))}
+            for n, q, x, y, w, h in rows
+        ]
+
+    def match_package_by_bbox(self, bbox, thresh=PACKAGE_IOU_THRESH):
+        """按 IoU 匹配最可能被取出的包装物品。"""
+        best, best_iou = None, thresh
+        for rec in self.get_package_locations():
+            iou = _iou(rec['bbox'], bbox)
+            if iou >= best_iou:
+                best, best_iou = rec, iou
+        return best
+
+    def adjust_package(self, old_name, new_name=None, new_qty=None,
+                       expire_date=None, category=None, shelf_id=None):
+        """修改包装物品名称和数量，供 App 纠错 OCR 结果。"""
+        old_name = (old_name or '').strip()
+        new_name = (new_name if new_name is not None else old_name).strip()
+        if not old_name:
+            return False, '缺少原包装物品名称'
+        if not new_name:
+            return False, '包装物品名称不能为空'
+        if new_qty is None:
+            return False, '缺少 qty 字段'
+
+        now = self._now()
+        row = self.conn.execute(
+            "SELECT id, quantity, expire_date, category, shelf_id FROM inventory WHERE class_name=? AND status='in' AND item_type='package'",
+            (old_name,)
+        ).fetchone()
+        if row is None:
+            return False, f'{old_name} 不在包装物品库存中'
+
+        rec_id, old_qty = row[0], row[1]
+        new_qty = max(0, int(new_qty))
+        status = 'out' if new_qty == 0 else 'in'
+        expire_date = (self._normalize_date(expire_date)
+                       if expire_date is not None else row[2])
+        category = (category if category is not None else row[3]) or '包装食品'
+        shelf_id = (shelf_id if shelf_id is not None else row[4]) or 'single'
+
+        if new_name != old_name and new_qty > 0:
+            existing = self.conn.execute(
+                "SELECT id, quantity FROM inventory WHERE class_name=? AND status='in' AND item_type='package'",
+                (new_name,)
+            ).fetchone()
+            if existing:
+                self.conn.execute(
+                    "UPDATE inventory SET quantity=?, last_update=?, source='manual', expire_date=?, category=?, shelf_id=? WHERE id=?",
+                    (existing[1] + new_qty, now, expire_date, category,
+                     shelf_id, existing[0])
+                )
+                self.conn.execute(
+                    "UPDATE inventory SET quantity=0, status='out', last_update=? WHERE id=?",
+                    (now, rec_id)
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE inventory SET class_name=?, quantity=?, status=?, last_update=?, source='manual', expire_date=?, category=?, shelf_id=? WHERE id=?",
+                    (new_name, new_qty, status, now, expire_date, category,
+                     shelf_id, rec_id)
+                )
+        else:
+            self.conn.execute(
+                "UPDATE inventory SET class_name=?, quantity=?, status=?, last_update=?, source='manual', expire_date=?, category=?, shelf_id=? WHERE id=?",
+                (new_name, new_qty, status, now, expire_date, category,
+                 shelf_id, rec_id)
+            )
+
+        diff = new_qty - old_qty
+        note = f'用户修正包装物品：{old_name} {old_qty}→{new_name} {new_qty}'
+        self.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?,?)",
+            (None, now, 'PACKAGE_MANUAL_ADJUST', -1, new_name, diff, note)
+        )
+        self.conn.commit()
+        print(f'[库存] 包装物品修正: {old_name} {old_qty}→{new_name} {new_qty}')
+        return True, note
 
     def _take_out(self, cls_id, qty, now, event_type):
         name = CLASSES[cls_id]
@@ -115,6 +298,29 @@ class InventoryManager:
         )
         self.conn.commit()
         print(f'[库存] 取出: {name} x{qty}')
+
+    def _take_out_package(self, name, qty, now):
+        row = self.conn.execute(
+            "SELECT id, quantity FROM inventory WHERE class_name=? AND status='in' AND item_type='package'",
+            (name,)
+        ).fetchone()
+        if row:
+            new_qty = max(0, row[1] - qty)
+            status = 'out' if new_qty == 0 else 'in'
+            self.conn.execute(
+                "UPDATE inventory SET quantity=?, status=?, last_update=? WHERE id=?",
+                (new_qty, status, now, row[0])
+            )
+            print(f'[库存] 包装物品取出: {name} x{qty}，剩余: {new_qty}')
+        else:
+            print(f'[库存] 警告: 取出包装物品{name}但库存无记录，跳过')
+
+        note = f'取出包装物品{name} x{qty}'
+        self.conn.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?,?)",
+            (None, now, 'PACKAGE_TAKE_OUT', -1, name, -qty, note)
+        )
+        self.conn.commit()
 
     def has_stock(self):
         """DB 里是否已有在库记录（用于判断是否首次启动）"""
@@ -155,6 +361,43 @@ class InventoryManager:
             "SELECT class_name, quantity, first_in, last_update FROM inventory WHERE status='in' AND quantity>0 ORDER BY last_update DESC"
         ).fetchall()
         return rows
+
+    def get_current_stock_records(self):
+        """获取当前库存，包含 App 可用于分组展示的类型字段。"""
+        rows = self.conn.execute(
+            "SELECT class_name, quantity, first_in, last_update, item_type, source, expire_date, category, shelf_id FROM inventory WHERE status='in' AND quantity>0 ORDER BY last_update DESC"
+        ).fetchall()
+        return [
+            {'name': n, 'qty': q, 'first_in': f, 'last_update': l,
+             'type': item_type or 'fresh', 'source': source or 'yolo',
+             'expire_date': expire_date,
+             'category': category or ('包装食品' if item_type == 'package'
+                                      else '生鲜食材'),
+             'shelf_id': shelf_id or 'single',
+             'days_to_expire': self._days_to_expire(expire_date),
+             'expire_status': self._expire_status(expire_date)}
+            for n, q, f, l, item_type, source, expire_date, category, shelf_id
+            in rows
+        ]
+
+    def _days_to_expire(self, expire_date):
+        if not expire_date:
+            return None
+        try:
+            d = datetime.strptime(expire_date, '%Y-%m-%d').date()
+        except ValueError:
+            return None
+        return (d - date.today()).days
+
+    def _expire_status(self, expire_date):
+        days = self._days_to_expire(expire_date)
+        if days is None:
+            return 'none'
+        if days < 0:
+            return 'expired'
+        if days <= 3:
+            return 'soon'
+        return 'normal'
 
     def get_recent_events(self, limit=10):
         """获取最近事件记录"""
