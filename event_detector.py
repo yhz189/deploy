@@ -163,17 +163,36 @@ class EventDetector:
         return [('PUT_IN', {'added': {ident['class_id']: count}})]
 
     def _take_out(self, bbox, ref_ident):
+        if ref_ident is not None:
+            count = ref_ident.get('count', 1)
+            removed = self._remove_items(
+                bbox, ref_ident['class_id'], count)
+            if removed:
+                return [('TAKE_OUT', {'removed': {ref_ident['class_id']: removed}})]
+            # 记忆未命中：回退用模型识别出的旧物品类别，避免吞掉出库事件
+            return [('TAKE_OUT', {'removed': {ref_ident['class_id']: count}})]
+
         rec = self._match_item(bbox)
         if rec is not None:
             self.placed_items.remove(rec)
             return [('TAKE_OUT', {'removed': {rec['class_id']: 1}})]
-        # 记忆未命中：回退用模型识别出的旧物品类别，避免吞掉出库事件
-        if ref_ident is not None:
-            return [('TAKE_OUT', {'removed': {ref_ident['class_id']: 1}})]
         return []
 
     def _handle_same(self, r):
         """同位置同粗类：按检测框面积判断部分取出 / 追加 / 位置抖动"""
+        if r.ref_ident['class_id'] == r.new_ident['class_id']:
+            cid = r.ref_ident['class_id']
+            ref_count = r.ref_ident.get('count', 1)
+            new_count = r.new_ident.get('count', 1)
+            if new_count < ref_count:
+                delta = ref_count - new_count
+                removed = self._remove_items(r.bbox, cid, delta)
+                return [('TAKE_OUT', {'removed': {cid: removed or delta}})]
+            if new_count > ref_count:
+                ident = dict(r.new_ident)
+                ident['count'] = new_count - ref_count
+                return self._put_in(r.bbox, ident)
+
         ra = r.ref_ident['area']
         na = r.new_ident['area']
         if ra <= 0:
@@ -199,3 +218,13 @@ class EventDetector:
         rec = self._match_item(old_bbox)
         if rec is not None:
             rec['bbox'] = new_bbox
+
+    def _remove_items(self, bbox, class_id, count):
+        removed = 0
+        for _ in range(count):
+            rec = self._match_item(bbox)
+            if rec is None or rec['class_id'] != class_id:
+                break
+            self.placed_items.remove(rec)
+            removed += 1
+        return removed

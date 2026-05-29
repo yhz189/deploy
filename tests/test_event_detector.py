@@ -124,6 +124,38 @@ def test_take_out_falls_back_to_ref_ident_when_memory_misses():
     assert events == [('TAKE_OUT', {'removed': {0: 1}})]
 
 
+def test_take_out_uses_ref_ident_count():
+    egg = _ident(19, 'egg', '肉蛋生鲜', 1000.0)
+    egg['count'] = 3
+    det = EventDetector(_fake_motion, None)
+    det.seed(STILL, [
+        {'class_id': 19, 'fine': 'egg', 'coarse': '肉蛋生鲜',
+         'bbox': (10, 10, 40, 40)}
+        for _ in range(3)
+    ])
+    region = ChangedRegion((10, 10, 40, 40), 'DISAPPEAR', egg, None)
+    events = det._analyze_regions([region])
+    assert events == [('TAKE_OUT', {'removed': {19: 3}})]
+    assert det.placed_items == []
+
+
+def test_same_region_uses_count_delta():
+    before = _ident(19, 'egg', '肉蛋生鲜', 1000.0)
+    before['count'] = 5
+    after = _ident(19, 'egg', '肉蛋生鲜', 1000.0)
+    after['count'] = 3
+    det = EventDetector(_fake_motion, None)
+    det.seed(STILL, [
+        {'class_id': 19, 'fine': 'egg', 'coarse': '肉蛋生鲜',
+         'bbox': (10, 10, 40, 40)}
+        for _ in range(5)
+    ])
+    region = ChangedRegion((10, 10, 40, 40), 'SAME', before, after)
+    events = det._analyze_regions([region])
+    assert events == [('TAKE_OUT', {'removed': {19: 2}})]
+    assert len(det.placed_items) == 3
+
+
 def test_package_disappear_emits_package_take_out():
     det = EventDetector(_fake_motion, None)
     det.seed(STILL, [])

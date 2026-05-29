@@ -19,7 +19,7 @@ from rknnlite.api import RKNNLite
 from utils import CLASSES, draw_results, postprocess, preprocess
 
 
-DEFAULT_MODEL = 'models/fridge_yolo_v3.rknn'
+DEFAULT_MODEL = 'models/fridge_yolo_opset11_rknn16.rknn'
 
 
 def _parse_crop(text):
@@ -40,12 +40,38 @@ def _load_model(path):
     return model
 
 
-def _infer(model, frame):
+def _dump_raw_outputs(outputs, top_k=12):
+    if outputs is None or outputs[0] is None:
+        print('raw outputs: None')
+        return
+    pred = outputs[0]
+    print(f'raw output[0].shape={getattr(pred, "shape", None)}')
+    if pred.ndim == 4:
+        pred = pred[:, :, :, 0]
+    pred = pred[0].T
+    raw_boxes = pred[:, :4]
+    cls_scores = pred[:, 4:]
+    confs = cls_scores.max(axis=1)
+    class_ids = cls_scores.argmax(axis=1)
+    order = confs.argsort()[::-1][:top_k]
+    print('top raw candidates:')
+    for i in order:
+        cid = int(class_ids[i])
+        print(
+            f'  idx={int(i):5d} cls={cid:2d}/{CLASSES[cid]:<12} '
+            f'conf={float(confs[i]):.4f} raw_box={raw_boxes[i].tolist()}'
+        )
+
+
+def _infer(model, frame, box_format='xywh', dump_raw=False):
     img_input, ratio, pad = preprocess(frame)
     t0 = time.time()
     outputs = model.inference(inputs=[img_input])
     dt = (time.time() - t0) * 1000
-    boxes, confs, class_ids = postprocess(outputs, ratio, pad, frame.shape)
+    if dump_raw:
+        _dump_raw_outputs(outputs)
+    boxes, confs, class_ids = postprocess(
+        outputs, ratio, pad, frame.shape, box_format=box_format)
     return boxes, confs, class_ids, dt
 
 
@@ -65,7 +91,8 @@ def _run_image(args, model):
         img = img[y:y + h, x:x + w]
         assert img.size > 0, f'裁剪区域为空: {crop}'
         print(f'使用裁剪区域: {crop}, crop_shape={img.shape}')
-    boxes, confs, class_ids, dt = _infer(model, img)
+    boxes, confs, class_ids, dt = _infer(
+        model, img, box_format=args.box_format, dump_raw=args.dump_raw)
     _print_result(boxes, confs, class_ids, dt)
     vis = draw_results(img.copy(), boxes, confs, class_ids)
     if args.output:
@@ -93,7 +120,9 @@ def _run_camera(args, model):
                 time.sleep(0.05)
                 continue
             frame_id += 1
-            boxes, confs, class_ids, dt = _infer(model, frame)
+            boxes, confs, class_ids, dt = _infer(
+                model, frame, box_format=args.box_format,
+                dump_raw=args.dump_raw and frame_id == 1)
             if frame_id % args.print_every == 0:
                 print(f'\nframe={frame_id}')
                 _print_result(boxes, confs, class_ids, dt)
@@ -130,6 +159,9 @@ def main():
     parser.add_argument('--save-dir')
     parser.add_argument('--save-every', type=int, default=30)
     parser.add_argument('--print-every', type=int, default=10)
+    parser.add_argument('--box-format', choices=['xyxy', 'xywh'],
+                        default='xywh')
+    parser.add_argument('--dump-raw', action='store_true')
     args = parser.parse_args()
 
     if args.image is None and args.camera is None:

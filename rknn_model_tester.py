@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 
 
-DEFAULT_MODEL = 'models/fridge_yolo_v3.rknn'
+DEFAULT_MODEL = 'models/fridge_yolo_opset11_rknn16.rknn'
 IMG_SIZE = 640
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 
@@ -121,7 +121,7 @@ def postprocess(
     conf_thresh=0.20,
     nms_thresh=0.45,
     max_candidates=300,
-    box_format='xyxy',
+    box_format='xywh',
     box_scale='auto',
 ):
     """Parse RKNN YOLOv8 output shaped (1, 23, 8400, 1)."""
@@ -277,7 +277,7 @@ def infer_one(
     conf_thresh,
     nms_thresh,
     max_candidates=300,
-    box_format='xyxy',
+    box_format='xywh',
     box_scale='auto',
 ):
     img_input, ratio, pad = preprocess(img_bgr)
@@ -882,8 +882,8 @@ def parse_args():
     parser.add_argument(
         '--box-format',
         choices=['xyxy', 'xywh'],
-        default='xyxy',
-        help='model box format. Use xywh if boxes are shifted/wrong-sized.',
+        default='xywh',
+        help='model box format. RKNN 1.6 YOLOv8 output uses xywh.',
     )
     parser.add_argument(
         '--box-scale',

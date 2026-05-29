@@ -17,7 +17,8 @@ import time
 import cv2
 from rknnlite.api import RKNNLite
 
-from utils import preprocess, postprocess, identify_crop, to_coarse, CLASSES
+from utils import (preprocess, postprocess, identify_crop, to_coarse, CLASSES,
+                   draw_results)
 from motion import is_moving
 from change_locator import find_change_regions, classify_regions
 from event_detector import EventDetector
@@ -25,12 +26,19 @@ from inventory import InventoryManager
 from package_ocr import (save_package_candidate,
                          save_package_takeout_candidate)
 
-RKNN_MODEL = 'models/fridge_yolo_v3.rknn'
+RKNN_MODEL = 'models/fridge_yolo_opset11_rknn16.rknn'
 CAMERA_ID = 0
 PREVIEW_PATH = '/tmp/fridge_latest.jpg'
 PREVIEW_INTERVAL = 30          # 每30帧保存一次预览（约1秒）
 REGION_SHOW_FRAMES = 90        # 分析结束后变化框持续显示的帧数
 PACKAGE_OCR_CONF_TRIGGER = 0.35  # YOLO 低置信度时尝试 OCR 辅助包装建档
+
+EGG_CLASS_ID = CLASSES.index('egg')
+EGG_COUNT_MIN_DELTA = 2
+EGG_COUNT_MIN_TOTAL = 4
+EGG_COUNT_CONF_THRESH = 0.10
+EGG_CROP_EXPAND = 2.0
+SHOW_INFER_INTERVAL = 1
 
 SHOW = '--show' in sys.argv    # 是否开实时显示窗口
 
@@ -58,9 +66,13 @@ def format_event(event_type, details):
     return f"{event_type} {' '.join(parts)}".strip()
 
 
-def draw_overlay(frame, state, frame_count, last_event='', regions=None):
+def draw_overlay(frame, state, frame_count, last_event='', regions=None,
+                 detections=None):
     """在帧上叠加状态/帧号/事件/变化区域，返回新图（不改原图）"""
     img = frame.copy()
+    if detections is not None:
+        boxes, confs, class_ids = detections
+        img = draw_results(img, boxes, confs, class_ids)
     if regions:
         for r in regions:
             x, y, w, h = r.bbox
@@ -150,6 +162,91 @@ def mark_package_take_out(regions, inv):
             r.ref_ident = {'name': match['name'], 'bbox': match['bbox']}
             print(f"[包装取出] 匹配到 {match['name']} bbox={match['bbox']}")
 
+def count_class_full_frame(model, frame, class_id, conf_thresh=None):
+    """Run YOLO on one frame or crop and count one class."""
+    img_input, ratio, pad = preprocess(frame)
+    outputs = model.inference(inputs=[img_input])
+    if outputs is None or outputs[0] is None:
+        return 0
+    _, _, class_ids = postprocess(
+        outputs, ratio, pad, frame.shape, conf_thresh=conf_thresh)
+    if len(class_ids) == 0:
+        return 0
+    return int(sum(int(cid) == class_id for cid in class_ids))
+
+
+def merge_region_bboxes(regions):
+    if not regions:
+        return None
+    x1 = min(r.bbox[0] for r in regions)
+    y1 = min(r.bbox[1] for r in regions)
+    x2 = max(r.bbox[0] + r.bbox[2] for r in regions)
+    y2 = max(r.bbox[1] + r.bbox[3] for r in regions)
+    return x1, y1, x2 - x1, y2 - y1
+
+
+def expand_bbox(bbox, frame_shape, scale):
+    x, y, w, h = bbox
+    img_h, img_w = frame_shape[:2]
+    cx = x + w / 2
+    cy = y + h / 2
+    nw = min(img_w, max(w * scale, w + 40))
+    nh = min(img_h, max(h * scale, h + 40))
+    x1 = max(0, int(round(cx - nw / 2)))
+    y1 = max(0, int(round(cy - nh / 2)))
+    x2 = min(img_w, int(round(cx + nw / 2)))
+    y2 = min(img_h, int(round(cy + nh / 2)))
+    return x1, y1, x2 - x1, y2 - y1
+
+
+def crop_by_bbox(frame, bbox):
+    x, y, w, h = bbox
+    return frame[y:y + h, x:x + w]
+
+
+def apply_zoom_crop_egg_delta(model, ref_frame, new_frame, regions):
+    """Use zoomed change crop YOLO count delta for dense egg trays."""
+    bbox = merge_region_bboxes(regions)
+    if bbox is None:
+        return regions
+    bbox = expand_bbox(bbox, new_frame.shape, EGG_CROP_EXPAND)
+    ref_crop = crop_by_bbox(ref_frame, bbox)
+    new_crop = crop_by_bbox(new_frame, bbox)
+    if ref_crop.size == 0 or new_crop.size == 0:
+        return regions
+
+    ref_count = count_class_full_frame(
+        model, ref_crop, EGG_CLASS_ID, conf_thresh=EGG_COUNT_CONF_THRESH)
+    new_count = count_class_full_frame(
+        model, new_crop, EGG_CLASS_ID, conf_thresh=EGG_COUNT_CONF_THRESH)
+    delta = new_count - ref_count
+    print(f'[EGG] zoom-crop count: {ref_count} -> {new_count}, '
+          f'delta={delta}, bbox={bbox}, conf={EGG_COUNT_CONF_THRESH}')
+    if (abs(delta) < EGG_COUNT_MIN_DELTA
+            or max(ref_count, new_count) < EGG_COUNT_MIN_TOTAL):
+        return regions
+
+    from change_locator import ChangedRegion
+    ident = {
+        'class_id': EGG_CLASS_ID,
+        'fine': 'egg',
+        'coarse': to_coarse(EGG_CLASS_ID),
+        'conf': 1.0,
+        'area': float(bbox[2] * bbox[3]),
+        'count': abs(delta),
+    }
+    if delta > 0:
+        return [ChangedRegion(bbox, 'APPEAR', None, ident)]
+    return [ChangedRegion(bbox, 'DISAPPEAR', ident, None)]
+
+
+def infer_full_frame(model, frame):
+    """Run YOLO on the current frame for --show debug visualization."""
+    img_input, ratio, pad = preprocess(frame)
+    outputs = model.inference(inputs=[img_input])
+    if outputs is None or outputs[0] is None:
+        return None
+    return postprocess(outputs, ratio, pad, frame.shape)
 
 def _replay_dir():
     """命令行里找 --replay 的目录参数，没有返回 None"""
@@ -220,6 +317,7 @@ def main():
         bboxes = find_change_regions(ref, new)
         print(f'[DEBUG] 变化区域: {len(bboxes)} 个, boxes={bboxes}')
         regions = classify_regions(ref, new, bboxes, classify_fn)
+        regions = apply_zoom_crop_egg_delta(model, ref, new, regions)
         for r in regions:
             print(f'[DEBUG] 区域: kind={r.kind} ref={r.ref_ident} new={r.new_ident}')
         mark_package_take_out(regions, inv)
@@ -252,6 +350,7 @@ def main():
     frame_count = 0
     prev_state = detector.state
     last_event_text = ''
+    show_detections = None
     region_show = 0          # 剩余显示变化框的帧数
     try:
         for frame in frames:
@@ -273,9 +372,11 @@ def main():
                 print(f'帧{frame_count:5d} | 状态:{state}')
 
             if SHOW:
+                if frame_count % SHOW_INFER_INTERVAL == 0:
+                    show_detections = infer_full_frame(model, frame)
                 regions = detector.last_regions if region_show > 0 else None
                 vis = draw_overlay(frame, state, frame_count,
-                                   last_event_text, regions)
+                                   last_event_text, regions, show_detections)
                 cv2.imshow('Fridge Monitor', vis)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     print('\n窗口退出')

@@ -24,12 +24,26 @@ def test_to_coarse_egg():
     assert to_coarse(CLASSES.index('egg')) == '肉蛋生鲜'
 
 
+def _xyxy_to_xywh(box):
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1)
+
+
 def _make_outputs(boxes_xyxy, class_id, scores):
-    """构造 (1, 4+len(CLASSES), N, 1) 的模型输出：前 4 行 xyxy，后 N 行类别得分"""
+    """构造 (1, 4+len(CLASSES), N, 1) 的模型输出：前 4 行 xywh，后 N 行类别得分"""
     n = len(boxes_xyxy)
     pred = np.zeros((1, 4 + len(CLASSES), n, 1), dtype=np.float32)
     for i, (box, score) in enumerate(zip(boxes_xyxy, scores)):
-        pred[0, 0:4, i, 0] = box
+        pred[0, 0:4, i, 0] = _xyxy_to_xywh(box)
+        pred[0, 4 + class_id, i, 0] = score
+    return [pred]
+
+
+def _make_outputs_xywh(boxes_xyxy, class_id, scores):
+    n = len(boxes_xyxy)
+    pred = np.zeros((1, 4 + len(CLASSES), n, 1), dtype=np.float32)
+    for i, (box, score) in enumerate(zip(boxes_xyxy, scores)):
+        pred[0, 0:4, i, 0] = _xyxy_to_xywh(box)
         pred[0, 4 + class_id, i, 0] = score
     return [pred]
 
@@ -47,6 +61,38 @@ def test_postprocess_nms_dedups_overlapping_boxes():
         outputs, ratio=1.0, pad=(0, 0), orig_shape=(480, 640, 3))
     assert len(boxes) == 2
     assert all(c == 0 for c in class_ids)
+
+
+def test_postprocess_supports_xywh_boxes():
+    outputs = _make_outputs_xywh(
+        boxes_xyxy=[(100, 100, 150, 150), (300, 300, 360, 360)],
+        class_id=0,
+        scores=[0.9, 0.85],
+    )
+    boxes, confs, class_ids = postprocess(
+        outputs, ratio=1.0, pad=(0, 0), orig_shape=(480, 640, 3),
+        box_format='xywh')
+    assert boxes.tolist() == [[100, 100, 150, 150], [300, 300, 360, 360]]
+    assert len(confs) == 2
+    assert all(c == 0 for c in class_ids)
+
+
+def test_postprocess_accepts_custom_conf_thresh():
+    outputs = _make_outputs(
+        boxes_xyxy=[(100, 100, 150, 150)],
+        class_id=0,
+        scores=[0.15],
+    )
+    boxes, _, _ = postprocess(
+        outputs, ratio=1.0, pad=(0, 0), orig_shape=(480, 640, 3))
+    assert boxes == []
+
+    boxes, confs, class_ids = postprocess(
+        outputs, ratio=1.0, pad=(0, 0), orig_shape=(480, 640, 3),
+        conf_thresh=0.10)
+    assert boxes.tolist() == [[100, 100, 150, 150]]
+    assert np.allclose(confs, [0.15])
+    assert class_ids.tolist() == [0]
 
 
 class _FakeModel:

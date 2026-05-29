@@ -31,6 +31,7 @@ def to_coarse(class_id):
 IMG_SIZE = 640
 CONF_THRESH = 0.20
 NMS_THRESH = 0.45
+BOX_FORMAT = 'xywh'
 
 
 def letterbox(img, new_shape=(416, 416), color=(114, 114, 114)):
@@ -55,11 +56,12 @@ def preprocess(img):
     """预处理：BGR→RGB，letterbox"""
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img_resized, ratio, pad = letterbox(img_rgb, (IMG_SIZE, IMG_SIZE))
-    img_input = np.expand_dims(img_resized, 0)  # [1,416,416,3]
+    img_input = np.expand_dims(img_resized, 0)  # uint8 NHWC: [1,640,640,3]
     return img_input, ratio, pad
 
 
-def postprocess(outputs, ratio, pad, orig_shape):
+def postprocess(outputs, ratio, pad, orig_shape, box_format=None,
+                conf_thresh=None):
     """
     YOLOv8后处理
     输出格式: (1, 24, 8400, 1)
@@ -72,14 +74,27 @@ def postprocess(outputs, ratio, pad, orig_shape):
     pred = pred[0]
     pred = pred.T
 
-    boxes_xyxy = pred[:, :4]       # 已经是x1y1x2y2
+    raw_boxes = pred[:, :4]
     cls_scores = pred[:, 4:]
+
+    fmt = (box_format or BOX_FORMAT).lower()
+    if fmt == 'xywh':
+        cx, cy, bw, bh = raw_boxes.T
+        boxes_xyxy = np.stack(
+            [cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2],
+            axis=1,
+        )
+    elif fmt == 'xyxy':
+        boxes_xyxy = raw_boxes
+    else:
+        raise ValueError(f'unsupported box_format: {fmt}')
 
     class_ids = np.argmax(cls_scores, axis=1)
     confidences = np.max(cls_scores, axis=1)
+    score_thresh = CONF_THRESH if conf_thresh is None else conf_thresh
 
     # 过滤：置信度 + 坐标不能全是0
-    valid = (confidences > CONF_THRESH) & (boxes_xyxy.sum(axis=1) > 0)
+    valid = (confidences > score_thresh) & (boxes_xyxy.sum(axis=1) > 0)
     boxes_xyxy = boxes_xyxy[valid]
     confidences = confidences[valid]
     class_ids = class_ids[valid]
@@ -103,7 +118,7 @@ def postprocess(outputs, ratio, pad, orig_shape):
     # NMS：cv2.dnn.NMSBoxes 要求 [x, y, w, h] 格式，需从 xyxy 转换
     boxes_xywh = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1)
     indices = cv2.dnn.NMSBoxes(
-        boxes_xywh.tolist(), confidences.tolist(), CONF_THRESH, NMS_THRESH
+        boxes_xywh.tolist(), confidences.tolist(), score_thresh, NMS_THRESH
     )
     if len(indices) == 0:
         return [], [], []

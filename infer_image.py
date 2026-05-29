@@ -23,7 +23,7 @@ else:
     print('运行环境：Ubuntu (RKNN 模拟器)')
 
 # ============ 配置 ============
-RKNN_MODEL = 'models/fridge_yolo_v3.rknn'
+RKNN_MODEL = 'models/fridge_yolo_opset11_rknn16.rknn'
 IMG_PATH = 'images/test.jpg'
 OUTPUT_PATH = 'results/test_result.jpg'
 
