@@ -61,7 +61,7 @@ def preprocess(img):
 
 
 def postprocess(outputs, ratio, pad, orig_shape, box_format=None,
-                conf_thresh=None):
+                conf_thresh=None, nms_thresh=None):
     """
     YOLOv8后处理
     输出格式: (1, 24, 8400, 1)
@@ -92,6 +92,7 @@ def postprocess(outputs, ratio, pad, orig_shape, box_format=None,
     class_ids = np.argmax(cls_scores, axis=1)
     confidences = np.max(cls_scores, axis=1)
     score_thresh = CONF_THRESH if conf_thresh is None else conf_thresh
+    nms_score_thresh = NMS_THRESH if nms_thresh is None else nms_thresh
 
     # 过滤：置信度 + 坐标不能全是0
     valid = (confidences > score_thresh) & (boxes_xyxy.sum(axis=1) > 0)
@@ -118,7 +119,8 @@ def postprocess(outputs, ratio, pad, orig_shape, box_format=None,
     # NMS：cv2.dnn.NMSBoxes 要求 [x, y, w, h] 格式，需从 xyxy 转换
     boxes_xywh = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1)
     indices = cv2.dnn.NMSBoxes(
-        boxes_xywh.tolist(), confidences.tolist(), score_thresh, NMS_THRESH
+        boxes_xywh.tolist(), confidences.tolist(), score_thresh,
+        nms_score_thresh
     )
     if len(indices) == 0:
         return [], [], []

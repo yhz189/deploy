@@ -111,3 +111,26 @@ def test_put_package_records_expiry_and_cloud_source(tmp_path):
         assert records[0]['shelf_id'] == 'upper'
     finally:
         inv.close()
+
+
+def test_take_out_missing_fresh_does_not_record_event(tmp_path):
+    inventory.DB_PATH = str(tmp_path / 'inventory.db')
+    inv = InventoryManager()
+    try:
+        inv.process_event('TAKE_OUT', {'removed': {0: 1}})
+        assert inv.get_current_stock_records() == []
+        assert inv.get_recent_events(5) == []
+    finally:
+        inv.close()
+
+
+def test_take_out_missing_package_does_not_record_event(tmp_path):
+    inventory.DB_PATH = str(tmp_path / 'inventory.db')
+    inv = InventoryManager()
+    try:
+        inv.process_event('PACKAGE_TAKE_OUT',
+                          {'removed_package': {'不存在的包装': 1}})
+        assert inv.get_current_stock_records() == []
+        assert inv.get_recent_events(5) == []
+    finally:
+        inv.close()

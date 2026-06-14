@@ -27,7 +27,7 @@ def _size_similar(b1, b2):
 class EventDetector:
 
     def __init__(self, motion_fn, locate_fn,
-                 enter_frames=3, exit_frames=10, settle_frames=5):
+                 enter_frames=3, exit_frames=10, settle_frames=12):
         self.motion_fn = motion_fn      # (prev_bgr, cur_bgr) -> bool
         self.locate_fn = locate_fn      # (ref_bgr, new_bgr) -> list[ChangedRegion]
         self.enter_frames = enter_frames
@@ -97,6 +97,7 @@ class EventDetector:
                 self._still_streak = 0
             else:
                 self._settle_streak += 1
+                self._settle_frame = frame.copy()
                 if self._settle_streak >= self.settle_frames:
                     events = self._analyze(self._settle_frame)
                     self.ref_frame = self._settle_frame.copy()

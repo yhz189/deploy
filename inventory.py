@@ -291,6 +291,8 @@ class InventoryManager:
         else:
             print(f'[库存] 警告: 取出{name}但库存无记录，跳过')
 
+            return
+
         note = f'{"部分取出" if event_type == "PARTIAL_TAKE_OUT" else "取出"}{qty}个{name}'
         self.conn.execute(
             "INSERT INTO events VALUES (?,?,?,?,?,?,?)",
@@ -314,6 +316,8 @@ class InventoryManager:
             print(f'[库存] 包装物品取出: {name} x{qty}，剩余: {new_qty}')
         else:
             print(f'[库存] 警告: 取出包装物品{name}但库存无记录，跳过')
+
+            return
 
         note = f'取出包装物品{name} x{qty}'
         self.conn.execute(

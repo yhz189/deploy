@@ -14,10 +14,21 @@ def test_one_added_object_returns_one_region():
     regions = find_change_regions(ref, new)
     assert len(regions) == 1
     x, y, w, h = regions[0]
-    # 变化区域应大致覆盖色块位置
-    assert 230 <= x <= 270
-    assert 190 <= y <= 270
-    assert w >= 70 and h >= 70
+    assert x <= 250 and y <= 200
+    assert x + w >= 350 and y + h >= 300
+    assert w >= 100 and h >= 100
+
+
+def test_nearby_fragments_are_merged_after_expansion():
+    ref = np.full((480, 640, 3), 100, dtype=np.uint8)
+    new = ref.copy()
+    new[200:250, 250:300] = 230
+    new[255:305, 305:355] = 230
+    regions = find_change_regions(ref, new)
+    assert len(regions) == 1
+    x, y, w, h = regions[0]
+    assert x <= 250 and y <= 200
+    assert x + w >= 355 and y + h >= 305
 
 
 def test_tiny_change_filtered_by_min_area():

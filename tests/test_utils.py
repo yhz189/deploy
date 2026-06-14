@@ -95,6 +95,24 @@ def test_postprocess_accepts_custom_conf_thresh():
     assert class_ids.tolist() == [0]
 
 
+def test_postprocess_accepts_custom_nms_thresh():
+    outputs = _make_outputs(
+        boxes_xyxy=[(100, 100, 150, 150),
+                    (105, 105, 155, 155)],
+        class_id=CLASSES.index('egg'),
+        scores=[0.9, 0.8],
+    )
+    boxes, _, _ = postprocess(
+        outputs, ratio=1.0, pad=(0, 0), orig_shape=(480, 640, 3))
+    assert len(boxes) == 1
+
+    boxes, _, class_ids = postprocess(
+        outputs, ratio=1.0, pad=(0, 0), orig_shape=(480, 640, 3),
+        nms_thresh=0.75)
+    assert len(boxes) == 2
+    assert all(c == CLASSES.index('egg') for c in class_ids)
+
+
 class _FakeModel:
     """模拟 RKNNLite：inference 返回预置的 outputs"""
     def __init__(self, outputs):

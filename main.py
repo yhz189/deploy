@@ -13,6 +13,7 @@ import os
 import sys
 import glob
 import time
+import json
 
 import cv2
 from rknnlite.api import RKNNLite
@@ -29,6 +30,7 @@ from package_ocr import (save_package_candidate,
 RKNN_MODEL = 'models/fridge_yolo_opset11_rknn16.rknn'
 CAMERA_ID = 0
 PREVIEW_PATH = '/tmp/fridge_latest.jpg'
+DEBUG_CROP_DIR = 'debug_crops'
 PREVIEW_INTERVAL = 30          # 每30帧保存一次预览（约1秒）
 REGION_SHOW_FRAMES = 90        # 分析结束后变化框持续显示的帧数
 PACKAGE_OCR_CONF_TRIGGER = 0.35  # YOLO 低置信度时尝试 OCR 辅助包装建档
@@ -38,9 +40,10 @@ EGG_COUNT_MIN_DELTA = 2
 EGG_COUNT_MIN_TOTAL = 4
 EGG_COUNT_CONF_THRESH = 0.10
 EGG_CROP_EXPAND = 2.0
-SHOW_INFER_INTERVAL = 1
+SHOW_INFER_INTERVAL = 5
 
 SHOW = '--show' in sys.argv    # 是否开实时显示窗口
+SHOW_INFER = '--show-infer' in sys.argv
 
 STATE_COLORS = {
     'STABLE':   (0, 200, 0),
@@ -204,6 +207,49 @@ def crop_by_bbox(frame, bbox):
     return frame[y:y + h, x:x + w]
 
 
+def save_event_crops(ref_frame, new_frame, regions):
+    """保存事件最终变化区域的动作前后裁剪图，供离线分析与复盘。"""
+    if not regions:
+        return None
+
+    stamp = time.strftime('%Y%m%d_%H%M%S')
+    idx = getattr(save_event_crops, '_idx', 0) + 1
+    save_event_crops._idx = idx
+    event_id = f'event_{stamp}_{idx:03d}'
+    out_dir = os.path.join(DEBUG_CROP_DIR, event_id)
+    os.makedirs(out_dir, exist_ok=True)
+
+    items = []
+    for i, region in enumerate(regions, start=1):
+        before = crop_by_bbox(ref_frame, region.bbox)
+        after = crop_by_bbox(new_frame, region.bbox)
+        before_name = f'final_{i:02d}_ref.jpg'
+        after_name = f'final_{i:02d}_new.jpg'
+        if before.size:
+            cv2.imwrite(os.path.join(out_dir, before_name), before)
+        if after.size:
+            cv2.imwrite(os.path.join(out_dir, after_name), after)
+        items.append({
+            'index': i,
+            'bbox': list(region.bbox),
+            'kind': region.kind,
+            'before_file': before_name,
+            'after_file': after_name,
+            'ref_ident': region.ref_ident,
+            'new_ident': region.new_ident,
+        })
+
+    with open(os.path.join(out_dir, 'metadata.json'), 'w',
+              encoding='utf-8') as f:
+        json.dump({
+            'event_id': event_id,
+            'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'regions': items,
+        }, f, ensure_ascii=False, indent=2)
+    print(f'[DEBUG_CROP] saved {out_dir}')
+    return out_dir
+
+
 def apply_zoom_crop_egg_delta(model, ref_frame, new_frame, regions):
     """Use zoomed change crop YOLO count delta for dense egg trays."""
     bbox = merge_region_bboxes(regions)
@@ -323,12 +369,17 @@ def main():
         mark_package_take_out(regions, inv)
         maybe_save_package_takeout_candidate(ref, new, regions)
         maybe_save_package_candidate(new, regions)
+        save_event_crops(ref, new, regions)
         return regions
 
     detector = EventDetector(is_moving, locate_fn)
     print('✓ 事件检测器就绪')
     if SHOW:
         print('✓ 显示窗口已开启（窗口内按 q 退出）')
+        if SHOW_INFER:
+            print(f'✓ 调试推理框已开启，每 {SHOW_INFER_INTERVAL} 帧刷新一次')
+        else:
+            print('提示：默认只显示状态/变化框；需要实时 YOLO 框请加 --show-infer')
 
     frames = open_source()
     first = next(frames, None)
@@ -372,7 +423,7 @@ def main():
                 print(f'帧{frame_count:5d} | 状态:{state}')
 
             if SHOW:
-                if frame_count % SHOW_INFER_INTERVAL == 0:
+                if SHOW_INFER and frame_count % SHOW_INFER_INTERVAL == 0:
                     show_detections = infer_full_frame(model, frame)
                 regions = detector.last_regions if region_show > 0 else None
                 vis = draw_overlay(frame, state, frame_count,

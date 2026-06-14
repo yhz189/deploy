@@ -164,3 +164,13 @@ def test_package_disappear_emits_package_take_out():
     events = det._analyze_regions([region])
     assert events == [('PACKAGE_TAKE_OUT',
                        {'removed_package': {'纯牛奶': 1}})]
+
+
+def test_ignored_region_emits_no_event():
+    det = EventDetector(_fake_motion, None)
+    det.seed(STILL, [])
+    region = ChangedRegion((10, 10, 40, 40), 'IGNORED',
+                           {'reason': 'unconfirmed_candidate_disappeared'},
+                           None)
+    events = det._analyze_regions([region])
+    assert events == []
