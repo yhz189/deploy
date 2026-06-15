@@ -1,4 +1,7 @@
 """事件检测器：两态状态机 + 物品位置记忆 + 变化定位事件派生"""
+from collections import deque
+
+from motion import is_stable_window
 
 PARTIAL_AREA_RATIO = 0.7
 IOU_MATCH_THRESH = 0.3
@@ -27,28 +30,78 @@ def _size_similar(b1, b2):
 class EventDetector:
 
     def __init__(self, motion_fn, locate_fn,
-                 enter_frames=3, exit_frames=10, settle_frames=12):
+                 enter_frames=3, exit_frames=10, settle_frames=12,
+                 stable_history_seconds=2.0, before_offset_seconds=1.0,
+                 settle_window_seconds=None, fallback_fps=30.0,
+                 stable_window_fn=None, rearrange_class_ids=None):
         self.motion_fn = motion_fn      # (prev_bgr, cur_bgr) -> bool
         self.locate_fn = locate_fn      # (ref_bgr, new_bgr) -> list[ChangedRegion]
         self.enter_frames = enter_frames
         self.exit_frames = exit_frames
         self.settle_frames = settle_frames
+        self.stable_history_seconds = float(stable_history_seconds)
+        self.before_offset_seconds = float(before_offset_seconds)
+        self.settle_window_seconds = settle_window_seconds
+        self.fallback_fps = float(fallback_fps)
+        self.stable_window_fn = stable_window_fn or (
+            lambda frames: is_stable_window(frames, self.motion_fn))
+        self.rearrange_class_ids = set(rearrange_class_ids or ())
 
         self.state = 'STABLE'
         self.prev_frame = None
         self.ref_frame = None
+        self.before_frame = None
         self.placed_items = []
         self._next_id = 1
+        self._frame_index = 0
         self._moving_streak = 0
         self._still_streak = 0
         self._settle_streak = 0
         self._settle_frame = None
+        self._stable_frames = deque()
+        self._settle_frames = deque()
+        self.last_capture_info = {}
         self.last_regions = []          # 最近一次分析的变化区域，供可视化读取
 
-    def seed(self, frame, detections):
+    def _timestamp(self, timestamp):
+        if timestamp is not None:
+            return float(timestamp)
+        return self._frame_index / self.fallback_fps
+
+    @staticmethod
+    def _append_pruned(buffer, timestamp, frame, max_age):
+        buffer.append((timestamp, frame.copy()))
+        while len(buffer) > 1 and timestamp - buffer[0][0] > max_age:
+            buffer.popleft()
+
+    def _remember_stable(self, timestamp, frame):
+        self._append_pruned(
+            self._stable_frames, timestamp, frame, self.stable_history_seconds)
+
+    def _select_before_frame(self, timestamp):
+        if not self._stable_frames:
+            return self.ref_frame.copy()
+        target = timestamp - self.before_offset_seconds
+        eligible = [item for item in self._stable_frames if item[0] <= target]
+        chosen = eligible[-1] if eligible else self._stable_frames[0]
+        return chosen[1].copy()
+
+    def _settle_window_ready(self):
+        if len(self._settle_frames) < self.settle_frames:
+            return False
+        if self.settle_window_seconds is not None:
+            duration = self._settle_frames[-1][0] - self._settle_frames[0][0]
+            if duration + 1e-9 < self.settle_window_seconds:
+                return False
+        frames = [frame for _, frame in self._settle_frames]
+        return self.stable_window_fn(frames)
+
+    def seed(self, frame, detections, timestamp=None):
         """开机播种：detections 为 [{'class_id','fine','coarse','bbox'}, ...]"""
+        timestamp = self._timestamp(timestamp)
         self.ref_frame = frame.copy()
         self.prev_frame = frame.copy()
+        self._remember_stable(timestamp, frame)
         for d in detections:
             self._add_item(d['class_id'], d['fine'], d['coarse'], d['bbox'])
 
@@ -59,12 +112,15 @@ class EventDetector:
         self._next_id += 1
         return rec
 
-    def update(self, frame):
+    def update(self, frame, timestamp=None):
         """喂入一帧，返回 (events, state)。events 为事件元组列表。"""
+        self._frame_index += 1
+        timestamp = self._timestamp(timestamp)
         events = []
         if self.prev_frame is None:
             self.prev_frame = frame.copy()
             self.ref_frame = frame.copy()
+            self._remember_stable(timestamp, frame)
             return events, self.state
 
         moving = self.motion_fn(self.prev_frame, frame)
@@ -74,12 +130,15 @@ class EventDetector:
             if moving:
                 self._moving_streak += 1
                 if self._moving_streak >= self.enter_frames:
+                    self.before_frame = self._select_before_frame(timestamp)
+                    self.ref_frame = self.before_frame.copy()
                     self.state = 'BUSY'
                     self._moving_streak = 0
                     self._still_streak = 0
             else:
                 self._moving_streak = 0
                 self.ref_frame = frame.copy()  # 静止期持续刷新参考图
+                self._remember_stable(timestamp, frame)
 
         elif self.state == 'BUSY':
             if moving:
@@ -90,17 +149,40 @@ class EventDetector:
                     self.state = 'SETTLING'
                     self._settle_streak = 0
                     self._settle_frame = frame.copy()
+                    self._settle_frames.clear()
+                    self._append_pruned(
+                        self._settle_frames, timestamp, frame,
+                        2 * (self.settle_window_seconds or
+                             self.settle_frames / self.fallback_fps))
 
         elif self.state == 'SETTLING':
             if moving:
                 self.state = 'BUSY'
                 self._still_streak = 0
+                self._settle_frames.clear()
             else:
                 self._settle_streak += 1
                 self._settle_frame = frame.copy()
-                if self._settle_streak >= self.settle_frames:
+                self._append_pruned(
+                    self._settle_frames, timestamp, frame,
+                    2 * (self.settle_window_seconds or
+                         self.settle_frames / self.fallback_fps))
+                if self._settle_window_ready():
+                    self.last_capture_info = {
+                        'before_semantic': 'before_action',
+                        'after_semantic': 'after_action',
+                        'before_selection': 'stable_history_about_1s_before',
+                        'after_selection': 'stable_window_last',
+                        'stable_window_size': len(self._settle_frames),
+                        'stable_window_seconds': (
+                            self._settle_frames[-1][0] -
+                            self._settle_frames[0][0]),
+                    }
                     events = self._analyze(self._settle_frame)
                     self.ref_frame = self._settle_frame.copy()
+                    self._stable_frames.clear()
+                    self._remember_stable(timestamp, self._settle_frame)
+                    self._settle_frames.clear()
                     self.state = 'STABLE'
 
         return events, self.state
@@ -119,8 +201,12 @@ class EventDetector:
             elif r.kind == 'DISAPPEAR':
                 disappears.append(r)
             elif r.kind == 'REPLACE':
-                events += self._take_out(r.bbox, r.ref_ident)
-                events += self._put_in(r.bbox, r.new_ident)
+                managed_replace = (
+                    r.ref_ident['class_id'] in self.rearrange_class_ids
+                    or r.new_ident['class_id'] in self.rearrange_class_ids)
+                if not managed_replace:
+                    events += self._take_out(r.bbox, r.ref_ident)
+                    events += self._put_in(r.bbox, r.new_ident)
             elif r.kind == 'SAME':
                 events += self._handle_same(r)
             elif r.kind == 'NOISE':
@@ -143,7 +229,13 @@ class EventDetector:
         for a in appears:
             match = None
             for d in unmatched:
-                if (a.new_ident['coarse'] == d.ref_ident['coarse']
+                same_coarse = a.new_ident['coarse'] == d.ref_ident['coarse']
+                managed_move = (
+                    (a.new_ident['class_id'] in self.rearrange_class_ids
+                     or d.ref_ident['class_id'] in self.rearrange_class_ids)
+                    and _iou(a.bbox, d.bbox) < 0.3
+                )
+                if ((same_coarse or managed_move)
                         and _size_similar(a.bbox, d.bbox)):
                     match = d
                     break
@@ -161,6 +253,8 @@ class EventDetector:
         for _ in range(count):
             self._add_item(ident['class_id'], ident['fine'],
                            ident['coarse'], bbox)
+        if ident['class_id'] in self.rearrange_class_ids:
+            return []
         return [('PUT_IN', {'added': {ident['class_id']: count}})]
 
     def _take_out(self, bbox, ref_ident):
@@ -168,6 +262,8 @@ class EventDetector:
             count = ref_ident.get('count', 1)
             removed = self._remove_items(
                 bbox, ref_ident['class_id'], count)
+            if ref_ident['class_id'] in self.rearrange_class_ids:
+                return []
             if removed:
                 return [('TAKE_OUT', {'removed': {ref_ident['class_id']: removed}})]
             # 记忆未命中：回退用模型识别出的旧物品类别，避免吞掉出库事件

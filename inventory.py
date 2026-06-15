@@ -8,6 +8,8 @@ from utils import CLASSES
 
 DB_PATH = 'inventory.db'
 PACKAGE_IOU_THRESH = 0.25
+LEVEL_MANAGED_NAMES = {'banana', 'carrot'}
+LEVEL_DEFAULT_RATIOS = {'无': 0.0, '少量': 0.18, '适量': 0.50, '大量': 0.82}
 
 
 def _iou(b1, b2):
@@ -63,7 +65,45 @@ class InventoryManager:
         self._ensure_column('inventory', 'category', 'TEXT')
         self._ensure_column('inventory', 'shelf_id',
                             "TEXT DEFAULT 'single'")
+        self._ensure_column('inventory', 'amount_mode',
+                            "TEXT DEFAULT 'count'")
+        self._ensure_column('inventory', 'amount_level', 'TEXT')
+        self._ensure_column('inventory', 'amount_ratio', 'REAL')
+        self._ensure_column('inventory', 'area_px', 'INTEGER')
+        self.conn.execute(
+            "UPDATE inventory SET amount_mode='level', "
+            "amount_level=CASE "
+            "WHEN quantity<=0 THEN '无' "
+            "WHEN quantity=1 THEN '少量' "
+            "WHEN quantity=2 THEN '适量' "
+            "ELSE '大量' END, "
+            "amount_ratio=CASE "
+            "WHEN quantity<=0 THEN 0.0 "
+            "WHEN quantity=1 THEN 0.18 "
+            "WHEN quantity=2 THEN 0.50 "
+            "ELSE 0.82 END, "
+            "quantity=CASE WHEN quantity<=0 THEN 0 ELSE 1 END "
+            "WHERE item_type='fresh' AND class_name IN ('banana','carrot') "
+            "AND COALESCE(amount_mode,'count')!='level'"
+        )
+        self._consolidate_level_items()
         self.conn.commit()
+
+    def _consolidate_level_items(self):
+        """历史库中每个等级型食材只保留一条记录。"""
+        for name in LEVEL_MANAGED_NAMES:
+            rows = self.conn.execute(
+                "SELECT id FROM inventory WHERE class_name=? "
+                "AND item_type='fresh' ORDER BY id DESC", (name,)
+            ).fetchall()
+            if len(rows) <= 1:
+                continue
+            keep_id = rows[0][0]
+            self.conn.execute(
+                "UPDATE inventory SET quantity=0, status='out' "
+                "WHERE class_name=? AND item_type='fresh' AND id!=?",
+                (name, keep_id)
+            )
 
     def _ensure_column(self, table, column, ddl):
         cols = [row[1] for row in self.conn.execute(
@@ -84,10 +124,14 @@ class InventoryManager:
 
         if event_type == 'PUT_IN':
             for cls_id, qty in details.get('added', {}).items():
+                if CLASSES[cls_id] in LEVEL_MANAGED_NAMES:
+                    continue
                 self._put_in(cls_id, qty, now)
 
         elif event_type in ('TAKE_OUT', 'PARTIAL_TAKE_OUT'):
             for cls_id, qty in details.get('removed', {}).items():
+                if CLASSES[cls_id] in LEVEL_MANAGED_NAMES:
+                    continue
                 self._take_out(cls_id, qty, now, event_type)
 
         elif event_type == 'PACKAGE_TAKE_OUT':
@@ -96,9 +140,107 @@ class InventoryManager:
 
         elif event_type == 'EXCHANGE':
             for cls_id, qty in details.get('added', {}).items():
+                if CLASSES[cls_id] in LEVEL_MANAGED_NAMES:
+                    continue
                 self._put_in(cls_id, qty, now)
             for cls_id, qty in details.get('removed', {}).items():
+                if CLASSES[cls_id] in LEVEL_MANAGED_NAMES:
+                    continue
                 self._take_out(cls_id, qty, now, 'TAKE_OUT')
+
+    def has_level_item(self, class_name):
+        row = self.conn.execute(
+            "SELECT 1 FROM inventory WHERE class_name=? AND amount_mode='level' LIMIT 1",
+            (class_name,)
+        ).fetchone()
+        return row is not None
+
+    def set_area_level(self, cls_id, level, ratio, area_px,
+                       source='opencv_area', action=None, delta_area_px=None):
+        """设置香蕉/胡萝卜的面积等级；等级是绝对状态，不使用增量个数。"""
+        name = CLASSES[cls_id]
+        if name not in LEVEL_MANAGED_NAMES:
+            return False, f'{name} 不是等级型库存'
+        if level not in ('无', '少量', '适量', '大量'):
+            return False, f'无效等级: {level}'
+
+        now = self._now()
+        ratio = min(1.0, max(0.0, float(ratio)))
+        area_px = max(0, int(area_px))
+        # A confirmed area increase cannot leave the item at "none".
+        if action == 'PUT_IN' and level == '无':
+            level = '少量'
+            ratio = max(ratio, LEVEL_DEFAULT_RATIOS['少量'])
+        row = self.conn.execute(
+            "SELECT id, amount_level, first_in FROM inventory "
+            "WHERE class_id=? AND item_type='fresh' ORDER BY id DESC LIMIT 1",
+            (cls_id,)
+        ).fetchone()
+        quantity = 0 if level == '无' else 1
+        status = 'in'
+
+        if row:
+            rec_id, old_level, first_in = row
+            self.conn.execute(
+                "UPDATE inventory SET quantity=?, status=?, last_update=?, "
+                "source=?, amount_mode='level', amount_level=?, "
+                "amount_ratio=?, area_px=?, first_in=? WHERE id=?",
+                (quantity, status, now, source, level, ratio, area_px,
+                 first_in or now, rec_id)
+            )
+        else:
+            old_level = '无'
+            self.conn.execute(
+                "INSERT INTO inventory "
+                "(class_id,class_name,quantity,first_in,last_update,status,"
+                "item_type,source,amount_mode,amount_level,amount_ratio,area_px) "
+                "VALUES (?,?,?,?,?,?,'fresh',?,'level',?,?,?)",
+                (cls_id, name, quantity, now, now, status, source,
+                 level, ratio, area_px)
+            )
+
+        action_events = {
+            'PUT_IN': ('AREA_PUT_IN', '放入'),
+            'TAKE_OUT': ('AREA_TAKE_OUT', '取出'),
+        }
+        if action in action_events:
+            event_type, action_text = action_events[action]
+            delta_text = (
+                f'，面积变化{int(delta_area_px):+d}px'
+                if delta_area_px is not None else '')
+            note = (
+                f'{action_text}{name}，余量：{old_level or "无"}→{level}'
+                f'{delta_text}')
+            self.conn.execute(
+                "INSERT INTO events "
+                "(event_time,event_type,class_id,class_name,quantity_change,note) "
+                "VALUES (?,?,?,?,?,?)",
+                (now, event_type, cls_id, name, 0, note)
+            )
+        elif old_level != level:
+            note = f'{name}余量等级：{old_level or "无"}→{level}'
+            self.conn.execute(
+                "INSERT INTO events "
+                "(event_time,event_type,class_id,class_name,quantity_change,note) "
+                "VALUES (?,?,?,?,?,?)",
+                (now, 'AREA_LEVEL_CHANGE', cls_id, name, 0, note)
+            )
+        else:
+            note = f'{name}余量等级保持{level}'
+        self.conn.commit()
+        print(f'[库存] {name} 面积等级: {level} ratio={ratio:.3f} area={area_px}')
+        return True, note
+
+    def adjust_area_level(self, class_name, level, ratio=None, area_px=0):
+        """人工修正等级型库存，供 App 纠错。"""
+        if class_name not in LEVEL_MANAGED_NAMES:
+            return False, f'{class_name} 不是等级型库存'
+        if level not in LEVEL_DEFAULT_RATIOS:
+            return False, f'无效等级: {level}'
+        cls_id = CLASSES.index(class_name)
+        ratio = LEVEL_DEFAULT_RATIOS[level] if ratio is None else ratio
+        return self.set_area_level(
+            cls_id, level, ratio, area_px, source='manual_level')
 
     def _put_in(self, cls_id, qty, now):
         name = CLASSES[cls_id]
@@ -335,6 +477,8 @@ class InventoryManager:
 
     def adjust_quantity(self, class_name, new_qty):
         """用户手动修正某种食材数量，写 DB + 记事件"""
+        if class_name in LEVEL_MANAGED_NAMES:
+            return False, f'{class_name} 使用面积等级，请勿按个数修正'
         now = self._now()
         row = self.conn.execute(
             "SELECT id, quantity, class_id FROM inventory WHERE class_name=? AND status='in'",
@@ -344,6 +488,8 @@ class InventoryManager:
             return False, f'{class_name} 不在库存中'
         old_qty, cls_id, rec_id = row[1], row[2], row[0]
         new_qty = max(0, int(new_qty))
+        if new_qty == old_qty:
+            return True, f'{class_name} 数量未变化'
         status = 'out' if new_qty == 0 else 'in'
         self.conn.execute(
             "UPDATE inventory SET quantity=?, status=?, last_update=? WHERE id=?",
@@ -362,14 +508,20 @@ class InventoryManager:
     def get_current_stock(self):
         """获取当前在库食材"""
         rows = self.conn.execute(
-            "SELECT class_name, quantity, first_in, last_update FROM inventory WHERE status='in' AND quantity>0 ORDER BY last_update DESC"
+            "SELECT class_name, quantity, first_in, last_update FROM inventory "
+            "WHERE status='in' AND (quantity>0 OR amount_mode='level') "
+            "ORDER BY last_update DESC"
         ).fetchall()
         return rows
 
     def get_current_stock_records(self):
         """获取当前库存，包含 App 可用于分组展示的类型字段。"""
         rows = self.conn.execute(
-            "SELECT class_name, quantity, first_in, last_update, item_type, source, expire_date, category, shelf_id FROM inventory WHERE status='in' AND quantity>0 ORDER BY last_update DESC"
+            "SELECT class_name, quantity, first_in, last_update, item_type, "
+            "source, expire_date, category, shelf_id, amount_mode, "
+            "amount_level, amount_ratio, area_px FROM inventory "
+            "WHERE status='in' AND (quantity>0 OR amount_mode='level') "
+            "ORDER BY last_update DESC"
         ).fetchall()
         return [
             {'name': n, 'qty': q, 'first_in': f, 'last_update': l,
@@ -379,8 +531,15 @@ class InventoryManager:
                                       else '生鲜食材'),
              'shelf_id': shelf_id or 'single',
              'days_to_expire': self._days_to_expire(expire_date),
-             'expire_status': self._expire_status(expire_date)}
-            for n, q, f, l, item_type, source, expire_date, category, shelf_id
+             'expire_status': self._expire_status(expire_date),
+             'amount_mode': amount_mode or 'count',
+             'amount_level': amount_level,
+             'amount_ratio': amount_ratio,
+             'area_px': area_px,
+             'display_amount': (amount_level if amount_mode == 'level'
+                                else f'{q}个')}
+            for n, q, f, l, item_type, source, expire_date, category, shelf_id,
+            amount_mode, amount_level, amount_ratio, area_px
             in rows
         ]
 
@@ -418,7 +577,15 @@ class InventoryManager:
         if not stock:
             print('  （空）')
         for name, qty, first_in, last_update in stock:
-            print(f'  {name}: {qty}个 | 入库:{first_in} | 更新:{last_update}')
+            if name in LEVEL_MANAGED_NAMES:
+                row = self.conn.execute(
+                    "SELECT amount_level FROM inventory WHERE class_name=? "
+                    "AND status='in' ORDER BY id DESC LIMIT 1", (name,)
+                ).fetchone()
+                print(f'  {name}: {row[0] if row else "未知"} | '
+                      f'入库:{first_in} | 更新:{last_update}')
+            else:
+                print(f'  {name}: {qty}个 | 入库:{first_in} | 更新:{last_update}')
         print('======================\n')
 
     def close(self):

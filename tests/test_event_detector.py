@@ -52,6 +52,50 @@ def test_motion_during_settling_returns_to_busy():
     assert det.state == 'BUSY'
 
 
+def test_before_frame_comes_from_stable_history_about_one_second_before():
+    seen = {}
+
+    def locate(ref, new):
+        seen['ref'] = int(ref[0, 1, 0])
+        seen['new'] = int(new[0, 1, 0])
+        return []
+
+    det = EventDetector(
+        _fake_motion, locate, enter_frames=3, exit_frames=2,
+        settle_frames=2, stable_history_seconds=2,
+        before_offset_seconds=1, settle_window_seconds=0.2)
+    det.seed(STILL, [], timestamp=0.0)
+    for i in range(1, 21):
+        frame = STILL.copy()
+        frame[0, 1, 0] = i
+        det.update(frame, timestamp=i * 0.1)
+    moving = MOVING.copy()
+    moving[0, 1, 0] = 99
+    for i in range(3):
+        det.update(moving, timestamp=2.1 + i * 0.1)
+    for i in range(5):
+        after = STILL.copy()
+        after[0, 1, 0] = 77
+        det.update(after, timestamp=2.4 + i * 0.1)
+    assert seen['ref'] == 13
+    assert seen['new'] == 77
+
+
+def test_settling_waits_when_window_first_and_last_are_not_consistent():
+    stable_answers = iter([False, True])
+    det = EventDetector(
+        _fake_motion, _fake_locate_empty, enter_frames=1, exit_frames=1,
+        settle_frames=2, stable_window_fn=lambda frames: next(stable_answers))
+    det.seed(STILL, [])
+    det.update(MOVING)
+    det.update(STILL)
+    _feed(det, STILL, 1)
+    assert det.state == 'SETTLING'
+    _feed(det, STILL, 1)
+    assert det.state == 'STABLE'
+    assert det.last_capture_info['after_selection'] == 'stable_window_last'
+
+
 from change_locator import ChangedRegion
 
 
@@ -100,6 +144,42 @@ def test_rearrange_is_suppressed():
     events = det._analyze_regions(regions)
     assert events == []
     assert len(det.placed_items) == 1  # 物品仍在，位置已更新
+
+
+def test_level_managed_move_suppresses_cross_class_misclassification():
+    banana = _ident(2, 'banana', '水果', 1000.0)
+    cucumber = _ident(9, 'Cucumber', '蔬菜', 1050.0)
+    det = EventDetector(_fake_motion, None, rearrange_class_ids={2, 10})
+    det.seed(STILL, [{'class_id': 2, 'fine': 'banana',
+                      'coarse': '水果', 'bbox': (10, 10, 40, 40)}])
+    regions = [
+        ChangedRegion((10, 10, 40, 40), 'DISAPPEAR', banana, None),
+        ChangedRegion((200, 200, 40, 42), 'APPEAR', None, cucumber),
+    ]
+    events = det._analyze_regions(regions)
+    assert events == []
+    assert det.placed_items[0]['bbox'] == (200, 200, 40, 42)
+
+
+def test_level_managed_replace_does_not_write_wrong_class_event():
+    banana = _ident(2, 'banana', '水果', 1000.0)
+    cucumber = _ident(9, 'Cucumber', '蔬菜', 1050.0)
+    det = EventDetector(_fake_motion, None, rearrange_class_ids={2, 10})
+    det.seed(STILL, [{'class_id': 2, 'fine': 'banana',
+                      'coarse': '水果', 'bbox': (10, 10, 40, 40)}])
+    region = ChangedRegion(
+        (10, 10, 80, 80), 'REPLACE', banana, cucumber)
+    assert det._analyze_regions([region]) == []
+
+
+def test_level_managed_appear_and_disappear_emit_no_count_events():
+    banana = _ident(2, 'banana', '水果', 1000.0)
+    det = EventDetector(_fake_motion, None, rearrange_class_ids={2, 10})
+    det.seed(STILL, [])
+    appear = ChangedRegion((10, 10, 40, 40), 'APPEAR', None, banana)
+    assert det._analyze_regions([appear]) == []
+    disappear = ChangedRegion((10, 10, 40, 40), 'DISAPPEAR', banana, None)
+    assert det._analyze_regions([disappear]) == []
 
 
 def test_partial_take_out_on_area_shrink():

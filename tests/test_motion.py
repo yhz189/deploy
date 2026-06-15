@@ -1,5 +1,5 @@
 import numpy as np
-from motion import is_moving
+from motion import changed_pixel_count, is_moving, is_stable_window
 
 
 def test_identical_frames_not_moving():
@@ -19,3 +19,11 @@ def test_tiny_noise_not_moving():
     cur = prev.copy()
     cur[0:5, 0:5] = 255  # 极小噪点，不算运动
     assert is_moving(prev, cur) is False
+
+
+def test_stable_window_rejects_slow_cumulative_change():
+    frames = [np.zeros((20, 20, 3), dtype=np.uint8) for _ in range(3)]
+    frames[-1][:] = 255
+    assert is_stable_window(frames, lambda a, b: changed_pixel_count(a, b) > 500)
+    assert is_stable_window(
+        frames, lambda a, b: changed_pixel_count(a, b) > 10) is False

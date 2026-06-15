@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+import uuid
 
 import cv2
 
@@ -15,6 +16,8 @@ PACKAGE_META_PATH = '/tmp/fridge_package_candidate.json'
 PACKAGE_TAKEOUT_REF_PATH = '/tmp/fridge_package_takeout_ref.jpg'
 PACKAGE_TAKEOUT_NEW_PATH = '/tmp/fridge_package_takeout_new.jpg'
 PACKAGE_TAKEOUT_META_PATH = '/tmp/fridge_package_takeout.json'
+PACKAGE_CANDIDATE_TTL_SECONDS = 60
+PACKAGE_CONFIRM_MIN_CONFIDENCE = 0.70
 
 _OCR_ENGINE = None
 _OCR_ENGINE_NAME = None
@@ -60,12 +63,27 @@ def _looks_like_spec(text):
                              text))
 
 
+def is_valid_package_text(text):
+    """包装名称必须像可读商品名，不能是规格、数字、符号或单字母。"""
+    raw = (text or '').strip()
+    if not raw or '\ufffd' in raw:
+        return False
+    norm = _normalize_text(raw)
+    if len(norm) < 2 or _looks_like_spec(norm):
+        return False
+    if re.fullmatch(r'[\d_]+', norm):
+        return False
+    if re.fullmatch(r'[A-Za-z]', norm):
+        return False
+    return bool(re.search(r'[A-Za-z\u4e00-\u9fff]', norm))
+
+
 def _choose_name(items):
     """从 OCR 行结果中挑一个更像商品名的候选。"""
     candidates = []
     for text, conf in items:
         norm = _normalize_text(text)
-        if len(norm) < 2 or _looks_like_spec(norm):
+        if not is_valid_package_text(norm):
             continue
         has_cn = bool(re.search(r'[\u4e00-\u9fff]', norm))
         score = float(conf) + min(len(norm), 8) * 0.02 + (0.1 if has_cn else 0)
@@ -136,9 +154,13 @@ def save_package_candidate(crop_bgr, ocr_result, bbox=None):
     """保存最新包装候选，供 Web/App 查询与确认。"""
     if crop_bgr is None or crop_bgr.size == 0:
         return None
+    clear_package_candidate()
+    now = time.time()
     os.makedirs(os.path.dirname(PACKAGE_CROP_PATH), exist_ok=True)
     cv2.imwrite(PACKAGE_CROP_PATH, crop_bgr)
     candidate = {
+        'candidate_id': uuid.uuid4().hex,
+        'status': 'pending_ocr',
         'ok': bool(ocr_result.get('ok')),
         'name': ocr_result.get('name') or '',
         'confidence': float(ocr_result.get('confidence') or 0.0),
@@ -146,7 +168,13 @@ def save_package_candidate(crop_bgr, ocr_result, bbox=None):
         'raw_text': ocr_result.get('raw_text', []),
         'error': ocr_result.get('error'),
         'bbox': bbox,
-        'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'created_at': time.strftime('%Y-%m-%d %H:%M:%S',
+                                    time.localtime(now)),
+        'expires_at': time.strftime(
+            '%Y-%m-%d %H:%M:%S',
+            time.localtime(now + PACKAGE_CANDIDATE_TTL_SECONDS)),
+        'created_epoch': now,
+        'expires_epoch': now + PACKAGE_CANDIDATE_TTL_SECONDS,
         'image_url': '/package/candidate/image',
     }
     with open(PACKAGE_META_PATH, 'w', encoding='utf-8') as f:
@@ -159,7 +187,11 @@ def load_package_candidate():
         return None
     try:
         with open(PACKAGE_META_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            candidate = json.load(f)
+        if float(candidate.get('expires_epoch', 0)) <= time.time():
+            clear_package_candidate()
+            return None
+        return candidate
     except Exception:
         return None
 
@@ -171,6 +203,46 @@ def clear_package_candidate():
                 os.remove(path)
         except OSError:
             pass
+
+
+def validate_package_confirmation(candidate_id, name, confidence):
+    """校验 App OCR 自动确认请求，返回 (ok, error, candidate)。"""
+    candidate = load_package_candidate()
+    if candidate is None:
+        return False, '候选不存在或已过期', None
+    if not candidate_id or candidate_id != candidate.get('candidate_id'):
+        return False, 'candidate_id 不匹配', candidate
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        return False, 'confidence 无效', candidate
+    if confidence < PACKAGE_CONFIRM_MIN_CONFIDENCE:
+        return False, 'OCR 置信度过低', candidate
+    if not is_valid_package_text(name):
+        return False, 'OCR 文本质量不合格', candidate
+    return True, '', candidate
+
+
+def consume_package_candidate(candidate_id, name, confidence):
+    """原子消费一个合格候选，避免并发确认导致重复入库。"""
+    ok, error, candidate = validate_package_confirmation(
+        candidate_id, name, confidence)
+    if not ok:
+        return ok, error, candidate
+
+    claimed_path = f'{PACKAGE_META_PATH}.{candidate_id}.consumed'
+    try:
+        os.replace(PACKAGE_META_PATH, claimed_path)
+    except OSError:
+        return False, '候选已被处理', None
+
+    for path in (claimed_path, PACKAGE_CROP_PATH):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+    return True, '', candidate
 
 
 def save_package_takeout_candidate(ref_crop, new_crop, bbox=None, reason=''):

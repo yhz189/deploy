@@ -120,6 +120,39 @@ def compare_banana_area(before_bgr, after_bgr, change_threshold=0.15,
     }
 
 
+def compare_banana_region(before_bgr, after_bgr, bbox,
+                          yolo_class_ids=(), banana_class_id=None,
+                          excluded_class_ids=(), change_threshold=0.15,
+                          min_delta_area_px=1000, **segment_kwargs):
+    """Compare banana-colored area in the same before/after change crop.
+
+    Strong local color evidence may override a wrong YOLO class, but an
+    explicitly excluded class (for example egg) always keeps its own event.
+    """
+    x, y, w, h = bbox
+    before_crop = before_bgr[y:y + h, x:x + w]
+    after_crop = after_bgr[y:y + h, x:x + w]
+    result = compare_banana_area(
+        before_crop, after_crop, change_threshold=change_threshold,
+        **segment_kwargs)
+
+    class_ids = {class_id for class_id in yolo_class_ids
+                 if class_id is not None}
+    has_banana_yolo = (
+        banana_class_id is not None and banana_class_id in class_ids)
+    has_excluded_yolo = bool(class_ids.intersection(excluded_class_ids))
+    strong_local_change = (
+        result['direction'] != 'NO_LEVEL_CHANGE'
+        and abs(result['delta_area_px']) >= int(min_delta_area_px))
+    result['is_banana_change'] = (
+        not has_excluded_yolo and (has_banana_yolo or strong_local_change)
+        and result['direction'] != 'NO_LEVEL_CHANGE')
+    result['has_banana_yolo'] = has_banana_yolo
+    result['has_excluded_yolo'] = has_excluded_yolo
+    result['bbox'] = bbox
+    return result
+
+
 def mask_overlay(image_bgr, mask, color=(0, 255, 255), alpha=0.45):
     """生成用于人工检查分割范围的叠加图。"""
     overlay = image_bgr.copy()

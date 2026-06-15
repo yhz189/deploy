@@ -1,8 +1,8 @@
 import cv2
 import numpy as np
 
-from banana_area import (compare_banana_area, measure_banana_area,
-                         quantity_level)
+from banana_area import (compare_banana_area, compare_banana_region,
+                         measure_banana_area, quantity_level)
 
 
 def _scene(width):
@@ -31,6 +31,40 @@ def test_compare_detects_put_in_and_take_out():
 def test_small_area_jitter_is_ignored():
     result = compare_banana_area(_scene(100), _scene(105))
     assert result['direction'] == 'NO_LEVEL_CHANGE'
+
+
+def test_region_compare_uses_same_crop_and_can_override_wrong_yolo_class():
+    before = np.full((200, 300, 3), 40, dtype=np.uint8)
+    after = before.copy()
+    cv2.rectangle(after, (80, 60), (220, 140), (0, 255, 255), -1)
+    result = compare_banana_region(
+        before, after, (50, 40, 200, 120), yolo_class_ids=[9],
+        banana_class_id=2, excluded_class_ids={19}, min_delta_area_px=1000)
+    assert result['direction'] == 'PUT_IN'
+    assert result['is_banana_change'] is True
+
+
+def test_region_compare_never_overrides_explicit_egg_event():
+    before = np.full((200, 300, 3), 40, dtype=np.uint8)
+    after = before.copy()
+    cv2.rectangle(after, (80, 60), (220, 140), (0, 255, 255), -1)
+    result = compare_banana_region(
+        before, after, (0, 0, 300, 200), yolo_class_ids=[19],
+        banana_class_id=2, excluded_class_ids={19}, min_delta_area_px=1000)
+    assert result['direction'] == 'PUT_IN'
+    assert result['is_banana_change'] is False
+
+
+def test_banana_move_with_same_area_is_not_inventory_change():
+    before = np.full((200, 300, 3), 40, dtype=np.uint8)
+    after = before.copy()
+    cv2.rectangle(before, (30, 60), (130, 140), (0, 255, 255), -1)
+    cv2.rectangle(after, (160, 60), (260, 140), (0, 255, 255), -1)
+    result = compare_banana_region(
+        before, after, (0, 30, 300, 150), yolo_class_ids=[2],
+        banana_class_id=2, excluded_class_ids={19}, min_delta_area_px=1000)
+    assert result['direction'] == 'NO_LEVEL_CHANGE'
+    assert result['is_banana_change'] is False
 
 
 def test_calibrated_levels():

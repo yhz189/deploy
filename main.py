@@ -24,8 +24,12 @@ from motion import is_moving
 from change_locator import find_change_regions, classify_regions
 from event_detector import EventDetector
 from inventory import InventoryManager
-from package_ocr import (save_package_candidate,
-                         save_package_takeout_candidate)
+from package_ocr import save_package_candidate
+from banana_area import (calibrated_ratio as banana_calibrated_ratio,
+                         compare_banana_region, measure_banana_area,
+                         quantity_level as banana_level)
+from carrot_area import (calibrated_ratio as carrot_calibrated_ratio,
+                         measure_carrot_area, quantity_level as carrot_level)
 
 RKNN_MODEL = 'models/fridge_yolo_opset11_rknn16.rknn'
 CAMERA_ID = 0
@@ -34,6 +38,9 @@ DEBUG_CROP_DIR = 'debug_crops'
 PREVIEW_INTERVAL = 30          # 每30帧保存一次预览（约1秒）
 REGION_SHOW_FRAMES = 90        # 分析结束后变化框持续显示的帧数
 PACKAGE_OCR_CONF_TRIGGER = 0.35  # YOLO 低置信度时尝试 OCR 辅助包装建档
+AREA_LEVEL_NAMES = ('banana', 'carrot')
+AREA_LEVEL_CLASS_IDS = {CLASSES.index(name) for name in AREA_LEVEL_NAMES}
+DEFAULT_FULL_AREA_RATIO = 0.30
 
 EGG_CLASS_ID = CLASSES.index('egg')
 EGG_COUNT_MIN_DELTA = 2
@@ -41,9 +48,64 @@ EGG_COUNT_MIN_TOTAL = 4
 EGG_COUNT_CONF_THRESH = 0.10
 EGG_CROP_EXPAND = 2.0
 SHOW_INFER_INTERVAL = 5
+BANANA_CROP_CHANGE_THRESHOLD = 0.15
+BANANA_CROP_MIN_DELTA_PX = 1000
+BANANA_CLASS_ID = CLASSES.index('banana')
 
 SHOW = '--show' in sys.argv    # 是否开实时显示窗口
 SHOW_INFER = '--show-infer' in sys.argv
+
+
+def _area_roi(frame, class_name):
+    """读取固定面积测量区域；默认整幅画面。"""
+    raw = os.getenv(
+        f'{class_name.upper()}_AREA_ROI',
+        os.getenv('FRIDGE_AREA_ROI', '')).strip()
+    if not raw:
+        return 0, 0, frame.shape[1], frame.shape[0]
+    try:
+        x, y, w, h = (int(v.strip()) for v in raw.split(','))
+    except Exception:
+        raise ValueError('FRIDGE_AREA_ROI 必须为 x,y,w,h')
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        raise ValueError('FRIDGE_AREA_ROI 必须为有效正数区域')
+    if x + w > frame.shape[1] or y + h > frame.shape[0]:
+        raise ValueError('FRIDGE_AREA_ROI 超出画面范围')
+    return x, y, w, h
+
+
+def measure_area_level(frame, class_name, empty_area_px=0):
+    """在固定 ROI 中测量香蕉/胡萝卜的当前绝对余量等级。"""
+    roi = _area_roi(frame, class_name)
+    x, y, w, h = roi
+    crop = frame[y:y + h, x:x + w]
+    if class_name == 'banana':
+        measured = measure_banana_area(crop)
+        calibrate = banana_calibrated_ratio
+        to_level = banana_level
+        env_name = 'BANANA_FULL_AREA_PX'
+    elif class_name == 'carrot':
+        measured = measure_carrot_area(crop)
+        calibrate = carrot_calibrated_ratio
+        to_level = carrot_level
+        env_name = 'CARROT_FULL_AREA_PX'
+    else:
+        raise ValueError(f'unsupported area class: {class_name}')
+
+    roi_area = (measured['image_area_px'] if 'image_area_px' in measured
+                else measured['roi_area_px'])
+    full_area = float(os.getenv(
+        env_name, empty_area_px + roi_area * DEFAULT_FULL_AREA_RATIO))
+    full_area = max(full_area, float(empty_area_px) + 1.0)
+    ratio = calibrate(measured['area_px'], empty_area_px, full_area)
+    return {
+        'level': to_level(ratio),
+        'ratio': ratio,
+        'area_px': measured['area_px'],
+        'roi': roi,
+        'full_area_px': full_area,
+        'empty_area_px': empty_area_px,
+    }
 
 STATE_COLORS = {
     'STABLE':   (0, 200, 0),
@@ -137,23 +199,6 @@ def maybe_save_package_candidate(new_frame, regions):
     return cand
 
 
-def maybe_save_package_takeout_candidate(ref_frame, new_frame, regions):
-    """保存非生鲜变化区域的前后裁剪图，供手机 OCR 判断包装取出。"""
-    candidates = [r for r in regions if r.kind == 'NOISE']
-    if not candidates:
-        return None
-
-    region = max(candidates, key=lambda rr: rr.bbox[2] * rr.bbox[3])
-    x, y, w, h = region.bbox
-    ref_crop = ref_frame[y:y + h, x:x + w]
-    new_crop = new_frame[y:y + h, x:x + w]
-    cand = save_package_takeout_candidate(
-        ref_crop, new_crop, bbox=region.bbox, reason='noise_region')
-    if cand is not None:
-        print('[OCR] 已保存包装取出候选前后图，等待手机端 OCR 判断')
-    return cand
-
-
 def mark_package_take_out(regions, inv):
     """把与已入库包装物品位置重合的 NOISE 区域标成包装取出事件。"""
     for r in regions:
@@ -207,7 +252,7 @@ def crop_by_bbox(frame, bbox):
     return frame[y:y + h, x:x + w]
 
 
-def save_event_crops(ref_frame, new_frame, regions):
+def save_event_crops(ref_frame, new_frame, regions, capture_info=None):
     """保存事件最终变化区域的动作前后裁剪图，供离线分析与复盘。"""
     if not regions:
         return None
@@ -244,6 +289,10 @@ def save_event_crops(ref_frame, new_frame, regions):
         json.dump({
             'event_id': event_id,
             'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'frame_semantics': capture_info or {
+                'before_semantic': 'before_action',
+                'after_semantic': 'after_action',
+            },
             'regions': items,
         }, f, ensure_ascii=False, indent=2)
     print(f'[DEBUG_CROP] saved {out_dir}')
@@ -353,6 +402,26 @@ def main():
     print('✓ 模型加载成功')
 
     inv = InventoryManager()
+    area_empty_baseline = {}
+
+    def area_result(frame, class_name):
+        return measure_area_level(
+            frame, class_name, area_empty_baseline.get(class_name, 0))
+
+    def sync_area_levels(frame, class_names, actions=None):
+        actions = actions or {}
+        for class_name in class_names:
+            class_id = CLASSES.index(class_name)
+            result = area_result(frame, class_name)
+            action = actions.get(class_name, {})
+            inv.set_area_level(
+                class_id, result['level'], result['ratio'], result['area_px'],
+                action=action.get('direction'),
+                delta_area_px=action.get('delta_area_px'))
+            print(f'[AREA] {class_name}: level={result["level"]} '
+                  f'ratio={result["ratio"]:.3f} area={result["area_px"]} '
+                  f'roi={result["roi"]} empty={result["empty_area_px"]:.0f} '
+                  f'full={result["full_area_px"]:.0f}')
 
     def classify_fn(crop):
         result = identify_crop(model, crop)
@@ -363,16 +432,54 @@ def main():
         bboxes = find_change_regions(ref, new)
         print(f'[DEBUG] 变化区域: {len(bboxes)} 个, boxes={bboxes}')
         regions = classify_regions(ref, new, bboxes, classify_fn)
+        area_evidence = {
+            ident['fine']
+            for r in regions
+            for ident in (r.ref_ident, r.new_ident)
+            if ident is not None and ident.get('class_id') in AREA_LEVEL_CLASS_IDS
+        }
+        banana_delta_px = 0
+        for region in regions:
+            if region.kind not in ('APPEAR', 'DISAPPEAR', 'REPLACE'):
+                continue
+            identities = (region.ref_ident, region.new_ident)
+            class_ids = [
+                ident.get('class_id') for ident in identities
+                if ident is not None]
+            local = compare_banana_region(
+                ref, new, region.bbox, yolo_class_ids=class_ids,
+                banana_class_id=BANANA_CLASS_ID,
+                excluded_class_ids={EGG_CLASS_ID},
+                change_threshold=BANANA_CROP_CHANGE_THRESHOLD,
+                min_delta_area_px=BANANA_CROP_MIN_DELTA_PX)
+            if not local['is_banana_change']:
+                continue
+            banana_delta_px += local['delta_area_px']
+            area_evidence.add('banana')
+            print('[AREA] 局部香蕉面积变化覆盖该区域的 YOLO 事件 '
+                  f'direction={local["direction"]} '
+                  f'delta={local["delta_area_px"]:+d}px '
+                  f'bbox={region.bbox} ref={region.ref_ident} '
+                  f'new={region.new_ident}')
+            region.kind = 'IGNORED'
+        area_actions = {}
+        if banana_delta_px:
+            area_actions['banana'] = {
+                'direction': 'PUT_IN' if banana_delta_px > 0 else 'TAKE_OUT',
+                'delta_area_px': banana_delta_px,
+            }
         regions = apply_zoom_crop_egg_delta(model, ref, new, regions)
         for r in regions:
             print(f'[DEBUG] 区域: kind={r.kind} ref={r.ref_ident} new={r.new_ident}')
         mark_package_take_out(regions, inv)
-        maybe_save_package_takeout_candidate(ref, new, regions)
         maybe_save_package_candidate(new, regions)
-        save_event_crops(ref, new, regions)
+        save_event_crops(ref, new, regions, detector.last_capture_info)
+        sync_area_levels(new, area_evidence, area_actions)
         return regions
 
-    detector = EventDetector(is_moving, locate_fn)
+    detector = EventDetector(
+        is_moving, locate_fn, settle_window_seconds=1.0,
+        rearrange_class_ids=AREA_LEVEL_CLASS_IDS)
     print('✓ 事件检测器就绪')
     if SHOW:
         print('✓ 显示窗口已开启（窗口内按 q 退出）')
@@ -386,7 +493,8 @@ def main():
     assert first is not None, '无可用帧'
 
     dets = seed_detections(model, first)
-    detector.seed(first, dets)          # 始终恢复位置记忆
+    replay = _replay_dir()
+    detector.seed(first, dets, timestamp=(0.0 if replay else time.monotonic()))
     if inv.has_stock():
         # 非首次启动：DB 已有库存（可能含用户手动修正）
         # 只恢复 placed_items 位置记忆，不再写 DB，保护用户数据
@@ -396,6 +504,12 @@ def main():
         for d in dets:
             inv.process_event('PUT_IN', {'added': {d['class_id']: 1}})
         print(f'✓ 首次启动播种：{len(dets)} 个物品')
+    seed_ids = {d['class_id'] for d in dets}
+    for class_name in AREA_LEVEL_NAMES:
+        class_id = CLASSES.index(class_name)
+        raw = measure_area_level(first, class_name)['area_px']
+        area_empty_baseline[class_name] = 0 if class_id in seed_ids else raw
+    sync_area_levels(first, set(AREA_LEVEL_NAMES))
     inv.print_stock()
 
     frame_count = 0
@@ -406,7 +520,10 @@ def main():
     try:
         for frame in frames:
             frame_count += 1
-            events, state = detector.update(frame)
+            capture_time = (
+                frame_count / detector.fallback_fps
+                if replay else time.monotonic())
+            events, state = detector.update(frame, timestamp=capture_time)
             for event_type, details in events:
                 inv.process_event(event_type, details)
                 last_event_text = format_event(event_type, details)

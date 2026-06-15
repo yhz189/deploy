@@ -20,6 +20,7 @@
 - 直接改下方 _INITIAL_STOCK / _INITIAL_EVENTS 改基线数据，改完重启服务
 """
 import copy
+import re
 from datetime import datetime
 
 import cv2
@@ -31,26 +32,44 @@ app = Flask(__name__)
 # ============== 初始基线数据（/dev/reset 会恢复到这里） ==============
 
 _INITIAL_STOCK = [
-    {"name": "banana", "qty": 2, "first_in": "2026-05-20 23:21:09",
+    {"name": "banana", "qty": 1, "first_in": "2026-05-20 23:21:09",
      "last_update": "2026-05-21 09:30:15", "type": "fresh",
      "source": "mock", "expire_date": None, "category": "生鲜食材",
-     "shelf_id": "single", "days_to_expire": None, "expire_status": "none"},
+     "shelf_id": "single", "days_to_expire": None, "expire_status": "none",
+     "amount_mode": "level", "amount_level": "适量", "amount_ratio": 0.52,
+     "area_px": 12000, "display_amount": "适量"},
+    {"name": "carrot", "qty": 1, "first_in": "2026-05-21 08:30:00",
+     "last_update": "2026-05-21 09:20:00", "type": "fresh",
+     "source": "mock", "expire_date": None, "category": "生鲜食材",
+     "shelf_id": "single", "days_to_expire": None, "expire_status": "none",
+     "amount_mode": "level", "amount_level": "少量", "amount_ratio": 0.18,
+     "area_px": 4200, "display_amount": "少量"},
     {"name": "apple", "qty": 3, "first_in": "2026-05-21 08:00:00",
      "last_update": "2026-05-21 08:00:00", "type": "fresh",
      "source": "mock", "expire_date": None, "category": "生鲜食材",
-     "shelf_id": "single", "days_to_expire": None, "expire_status": "none"},
+     "shelf_id": "single", "days_to_expire": None, "expire_status": "none",
+     "amount_mode": "count", "amount_level": None, "amount_ratio": None,
+     "area_px": None, "display_amount": "3个"},
     {"name": "Tomato", "qty": 1, "first_in": "2026-05-21 09:15:30",
      "last_update": "2026-05-21 09:15:30", "type": "fresh",
      "source": "mock", "expire_date": None, "category": "生鲜食材",
-     "shelf_id": "single", "days_to_expire": None, "expire_status": "none"},
+     "shelf_id": "single", "days_to_expire": None, "expire_status": "none",
+     "amount_mode": "count", "amount_level": None, "amount_ratio": None,
+     "area_px": None, "display_amount": "1个"},
     {"name": "纯牛奶", "qty": 1, "first_in": "2026-05-21 10:10:00",
      "last_update": "2026-05-21 10:10:00", "type": "package",
      "source": "phone_ocr", "expire_date": "2026-06-01",
      "category": "饮料乳品", "shelf_id": "single",
-     "days_to_expire": 7, "expire_status": "normal"},
+     "days_to_expire": 7, "expire_status": "normal",
+     "amount_mode": "count", "amount_level": None, "amount_ratio": None,
+     "area_px": None, "display_amount": "1个"},
 ]
 
 _INITIAL_EVENTS = [
+    {"time": "2026-05-21 09:35:15", "type": "AREA_TAKE_OUT",
+     "note": "取出banana，余量：适量→少量，面积变化-3200px"},
+    {"time": "2026-05-21 09:30:15", "type": "AREA_PUT_IN",
+     "note": "放入banana，余量：少量→适量，面积变化+5400px"},
     {"time": "2026-05-21 09:30:15", "type": "PARTIAL_TAKE_OUT",
      "note": "部分取出1个banana（估计）"},
     {"time": "2026-05-21 09:15:30", "type": "PUT_IN", "note": "放入1个Tomato"},
@@ -63,6 +82,8 @@ _INITIAL_EVENTS = [
 MOCK_STOCK = copy.deepcopy(_INITIAL_STOCK)
 MOCK_EVENTS = copy.deepcopy(_INITIAL_EVENTS)
 MOCK_PACKAGE_CANDIDATE = {
+    "candidate_id": "mock-package-candidate-001",
+    "status": "pending_ocr",
     "ok": False,
     "name": "",
     "confidence": 0.0,
@@ -70,7 +91,8 @@ MOCK_PACKAGE_CANDIDATE = {
     "raw_text": [],
     "error": "pending phone OCR",
     "bbox": [120, 90, 260, 180],
-    "time": "2026-05-21 10:10:00",
+    "created_at": "2026-06-14 12:00:00",
+    "expires_at": "2099-06-14 12:01:00",
     "image_url": "/package/candidate/image",
 }
 MOCK_PACKAGE_TAKEOUT_CANDIDATE = {
@@ -87,6 +109,8 @@ MOCK_PACKAGE_TAKEOUT_CANDIDATE = {
 
 def _apply_to_stock(etype, food, n):
     """把事件同步到库存，模拟真实后端「事件→库存」的联动"""
+    if food in ('banana', 'carrot'):
+        return
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     item = next((s for s in MOCK_STOCK if s['name'] == food), None)
     if etype == 'PUT_IN':
@@ -100,13 +124,28 @@ def _apply_to_stock(etype, food, n):
                                'expire_date': None, 'category': '生鲜食材',
                                'shelf_id': 'single',
                                'days_to_expire': None,
-                               'expire_status': 'none'})
+                               'expire_status': 'none',
+                               'amount_mode': 'count',
+                               'amount_level': None,
+                               'amount_ratio': None, 'area_px': None,
+                               'display_amount': f'{n}个'})
     elif etype in ('TAKE_OUT', 'PARTIAL_TAKE_OUT'):
         if item:
             item['qty'] -= n
             item['last_update'] = now
             if item['qty'] <= 0:
                 MOCK_STOCK.remove(item)   # 取空则从库存移除
+
+
+def _valid_package_text(text):
+    raw = (text or '').strip()
+    compact = re.sub(r'[^\w\u4e00-\u9fff]+', '', raw)
+    if not compact or '\ufffd' in raw or len(compact) < 2:
+        return False
+    if re.fullmatch(r'\d+(\.\d+)?(g|kg|ml|l|克|千克|毫升|升)?',
+                    compact, re.IGNORECASE):
+        return False
+    return bool(re.search(r'[A-Za-z\u4e00-\u9fff]', compact))
 
 
 # ============== 路由 ==============
@@ -139,12 +178,27 @@ def camera():
 @app.route('/api/package/candidate')
 def api_package_candidate():
     """模拟疑似包装物品裁剪图，App 端拿图后做 OCR。"""
+    if MOCK_PACKAGE_CANDIDATE is None:
+        return jsonify({'ok': False, 'error': '暂无包装候选'}), 404
     return jsonify(MOCK_PACKAGE_CANDIDATE)
+
+
+@app.route('/api/package/candidate', methods=['DELETE'])
+def api_delete_package_candidate():
+    global MOCK_PACKAGE_CANDIDATE
+    if MOCK_PACKAGE_CANDIDATE is None:
+        return jsonify({'ok': False, 'error': '暂无包装候选'}), 404
+    if request.args.get('candidate_id') != MOCK_PACKAGE_CANDIDATE['candidate_id']:
+        return jsonify({'ok': False, 'error': 'candidate_id 不匹配'}), 409
+    MOCK_PACKAGE_CANDIDATE = None
+    return jsonify({'ok': True, 'msg': '候选已丢弃'})
 
 
 @app.route('/package/candidate/image')
 def package_candidate_image():
     """返回一张模拟包装裁剪图。"""
+    if MOCK_PACKAGE_CANDIDATE is None:
+        return '', 204
     img = np.full((260, 420, 3), 245, dtype=np.uint8)
     cv2.rectangle(img, (25, 30), (395, 230), (40, 120, 220), 3)
     cv2.putText(img, 'PACKAGE OCR', (70, 85),
@@ -213,6 +267,15 @@ def dev_add_event(etype, food):
                     "stock": MOCK_STOCK})
 
 
+@app.route('/dev/set_level/<food>/<level>')
+def dev_set_level(food, level):
+    """开发用：设置香蕉/胡萝卜等级，模拟面积测量结果。"""
+    with app.test_request_context(json={
+            'name': food, 'level': level,
+            'ratio': request.args.get('ratio', type=float)}):
+        return api_adjust_level()
+
+
 @app.route('/api/stock/adjust', methods=['POST'])
 def api_adjust():
     """用户手动修正库存数量（与真实板子接口保持一致）
@@ -222,6 +285,9 @@ def api_adjust():
     if not data or 'name' not in data or 'qty' not in data:
         return jsonify({'ok': False, 'error': '缺少 name 或 qty 字段'}), 400
     name = data['name']
+    if name in ('banana', 'carrot'):
+        return jsonify({'ok': False,
+                        'error': f'{name} 使用面积等级，请勿按个数修正'}), 400
     new_qty = max(0, int(data['qty']))
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     item = next((s for s in MOCK_STOCK if s['name'] == name), None)
@@ -229,6 +295,7 @@ def api_adjust():
         return jsonify({'ok': False, 'error': f'{name} 不在库存中'}), 404
     old_qty = item['qty']
     item['qty'] = new_qty
+    item['display_amount'] = f'{new_qty}个'
     item['last_update'] = now
     if new_qty == 0:
         MOCK_STOCK.remove(item)
@@ -240,14 +307,61 @@ def api_adjust():
     return jsonify({'ok': True, 'msg': f'{name} {old_qty}→{new_qty}'})
 
 
+@app.route('/api/stock/adjust-level', methods=['POST'])
+def api_adjust_level():
+    data = request.get_json(silent=True)
+    if not data or 'name' not in data or 'level' not in data:
+        return jsonify({'ok': False, 'error': '缺少 name 或 level 字段'}), 400
+    name, level = data['name'], data['level']
+    if name not in ('banana', 'carrot'):
+        return jsonify({'ok': False, 'error': f'{name} 不是等级型库存'}), 400
+    ratios = {'无': 0.0, '少量': 0.18, '适量': 0.50, '大量': 0.82}
+    if level not in ratios:
+        return jsonify({'ok': False, 'error': f'无效等级: {level}'}), 400
+    ratio = data.get('ratio')
+    ratio = ratios[level] if ratio is None else float(ratio)
+    item = next((s for s in MOCK_STOCK if s['name'] == name), None)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if item is None:
+        item = {'name': name, 'qty': 0, 'first_in': now,
+                'type': 'fresh', 'expire_date': None,
+                'category': '生鲜食材', 'shelf_id': 'single',
+                'days_to_expire': None, 'expire_status': 'none'}
+        MOCK_STOCK.append(item)
+    item.update({
+        'qty': 0 if level == '无' else 1,
+        'last_update': now, 'source': 'manual_level',
+        'amount_mode': 'level', 'amount_level': level,
+        'amount_ratio': ratio,
+        'area_px': int(data.get('area_px', 0)),
+        'display_amount': level,
+    })
+    return jsonify({'ok': True, 'msg': f'{name}余量等级设置为{level}'})
+
+
 @app.route('/api/package/confirm', methods=['POST'])
 def api_package_confirm():
     """手机端 OCR 后提交包装物品入库
-    POST JSON: {"name": "纯牛奶", "qty": 1}
+    POST JSON: {"candidate_id": "...", "name": "纯牛奶",
+                "confidence": 0.86, "qty": 1}
     """
     data = request.get_json(silent=True)
-    if not data or 'name' not in data:
-        return jsonify({'ok': False, 'error': '缺少 name 字段'}), 400
+    global MOCK_PACKAGE_CANDIDATE
+    if not data or 'name' not in data or 'candidate_id' not in data:
+        return jsonify({'ok': False,
+                        'error': '缺少 candidate_id 或 name 字段'}), 400
+    if MOCK_PACKAGE_CANDIDATE is None:
+        return jsonify({'ok': False, 'error': '候选不存在或已过期'}), 409
+    if data['candidate_id'] != MOCK_PACKAGE_CANDIDATE['candidate_id']:
+        return jsonify({'ok': False, 'error': 'candidate_id 不匹配'}), 409
+    try:
+        confidence = float(data.get('confidence') or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence < 0.70:
+        return jsonify({'ok': False, 'error': 'OCR 置信度过低'}), 409
+    if not _valid_package_text(data['name']):
+        return jsonify({'ok': False, 'error': 'OCR 文本质量不合格'}), 409
     name = data['name'].strip()
     qty = max(1, int(data.get('qty', 1)))
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -266,10 +380,14 @@ def api_package_confirm():
             "shelf_id": data.get('shelf_id', 'single'),
             "days_to_expire": None,
             "expire_status": "none",
+            "amount_mode": "count", "amount_level": None,
+            "amount_ratio": None, "area_px": None,
+            "display_amount": f"{qty}个",
         })
     note = f'包装物品入库：{name} x{qty}'
     MOCK_EVENTS.insert(0, {"time": now, "type": "PACKAGE_PUT_IN",
                            "note": note})
+    MOCK_PACKAGE_CANDIDATE = None
     return jsonify({'ok': True, 'msg': note, 'stock': MOCK_STOCK})
 
 
@@ -293,6 +411,7 @@ def api_package_adjust():
     old_qty = item['qty']
     item['name'] = new_name
     item['qty'] = qty
+    item['display_amount'] = f'{qty}个'
     item['last_update'] = now
     item['source'] = 'manual'
     item['expire_date'] = data.get('expire_date', item.get('expire_date'))
@@ -331,6 +450,9 @@ def api_cloud_confirm():
             "shelf_id": data.get('shelf_id', 'single'),
             "days_to_expire": None,
             "expire_status": "none",
+            "amount_mode": "count", "amount_level": None,
+            "amount_ratio": None, "area_px": None,
+            "display_amount": f"{qty}个",
         })
     note = f'云端识别入库：{name} x{qty}'
     MOCK_EVENTS.insert(0, {"time": now, "type": "CLOUD_PUT_IN",
@@ -365,9 +487,23 @@ def api_package_takeout():
 @app.route('/dev/reset')
 def dev_reset():
     """开发用：库存和事件都恢复到初始基线"""
-    global MOCK_STOCK, MOCK_EVENTS
+    global MOCK_STOCK, MOCK_EVENTS, MOCK_PACKAGE_CANDIDATE
     MOCK_STOCK = copy.deepcopy(_INITIAL_STOCK)
     MOCK_EVENTS = copy.deepcopy(_INITIAL_EVENTS)
+    MOCK_PACKAGE_CANDIDATE = {
+        "candidate_id": "mock-package-candidate-001",
+        "status": "pending_ocr",
+        "ok": False,
+        "name": "",
+        "confidence": 0.0,
+        "engine": "phone_ocr",
+        "raw_text": [],
+        "error": "pending phone OCR",
+        "bbox": [120, 90, 260, 180],
+        "created_at": "2026-06-14 12:00:00",
+        "expires_at": "2099-06-14 12:01:00",
+        "image_url": "/package/candidate/image",
+    }
     return jsonify({"ok": True})
 
 

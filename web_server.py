@@ -9,6 +9,7 @@ from utils import CLASSES
 from package_ocr import (
     PACKAGE_CROP_PATH, PACKAGE_TAKEOUT_NEW_PATH, PACKAGE_TAKEOUT_REF_PATH,
     clear_package_candidate, clear_package_takeout_candidate,
+    consume_package_candidate,
     load_package_candidate, load_package_takeout_candidate,
 )
 
@@ -61,7 +62,7 @@ HTML = '''
             <tr>
                 <td>{{ item.name }}</td>
                 <td>{{ '包装物品' if item.type == 'package' else '生鲜食材' }}</td>
-                <td><span class="badge">{{ item.qty }} 个</span></td>
+                <td><span class="badge">{{ item.display_amount }}</span></td>
                 <td class="time">{{ item.first_in }}</td>
                 <td class="time">{{ item.last_update }}</td>
             </tr>
@@ -81,8 +82,16 @@ HTML = '''
             <tr>
                 <td class="time">{{ time }}</td>
                 <td>
-                    {% if 'PUT_IN' in etype %}
+                    {% if 'AREA_PUT_IN' in etype %}
                     <span class="badge">放入</span>
+                    {% elif 'AREA_TAKE_OUT' in etype %}
+                    <span class="badge badge-out">取出</span>
+                    {% elif 'PUT_IN' in etype %}
+                    <span class="badge">放入</span>
+                    {% elif 'AREA_LEVEL_CHANGE' in etype %}
+                    <span class="badge badge-partial">余量变化</span>
+                    {% elif 'MANUAL_ADJUST' in etype %}
+                    <span class="badge badge-partial">手动修正</span>
                     {% elif 'PARTIAL' in etype %}
                     <span class="badge badge-partial">部分取出·估计</span>
                     {% else %}
@@ -163,6 +172,21 @@ def api_adjust():
     return jsonify({'ok': ok, 'msg': msg}), (200 if ok else 404)
 
 
+@app.route('/api/stock/adjust-level', methods=['POST'])
+def api_adjust_level():
+    """人工修正香蕉/胡萝卜面积等级。
+    POST JSON: {"name": "banana", "level": "适量"}
+    """
+    data = request.get_json(silent=True)
+    if not data or 'name' not in data or 'level' not in data:
+        return jsonify({'ok': False, 'error': '缺少 name 或 level 字段'}), 400
+    inv = InventoryManager()
+    ok, msg = inv.adjust_area_level(
+        data['name'], data['level'], data.get('ratio'), data.get('area_px', 0))
+    inv.close()
+    return jsonify({'ok': ok, 'msg': msg}), (200 if ok else 400)
+
+
 @app.route('/api/package/candidate')
 def api_package_candidate():
     """返回最近一次疑似包装物品裁剪图，供 App 做本地 OCR。"""
@@ -172,10 +196,23 @@ def api_package_candidate():
     return jsonify(cand)
 
 
+@app.route('/api/package/candidate', methods=['DELETE'])
+def api_delete_package_candidate():
+    """App OCR 失败时丢弃当前候选；ID 不匹配时不清理新候选。"""
+    cand = load_package_candidate()
+    if cand is None:
+        return jsonify({'ok': False, 'error': '候选不存在或已过期'}), 404
+    candidate_id = request.args.get('candidate_id')
+    if not candidate_id or candidate_id != cand.get('candidate_id'):
+        return jsonify({'ok': False, 'error': 'candidate_id 不匹配'}), 409
+    clear_package_candidate()
+    return jsonify({'ok': True, 'msg': '候选已丢弃'})
+
+
 @app.route('/package/candidate/image')
 def package_candidate_image():
     """返回最近一次包装变化区域裁剪图。"""
-    if not os.path.exists(PACKAGE_CROP_PATH):
+    if load_package_candidate() is None or not os.path.exists(PACKAGE_CROP_PATH):
         return '暂无包装裁剪图', 204
     return send_file(PACKAGE_CROP_PATH, mimetype='image/jpeg')
 
@@ -183,13 +220,18 @@ def package_candidate_image():
 @app.route('/api/package/confirm', methods=['POST'])
 def api_package_confirm():
     """手机端 OCR 后提交包装物品入库
-    POST JSON: {"name": "纯牛奶", "qty": 1}
+    POST JSON: {"candidate_id": "...", "name": "纯牛奶",
+                "confidence": 0.86, "qty": 1}
     """
     data = request.get_json(silent=True)
-    if not data or 'name' not in data:
-        return jsonify({'ok': False, 'error': '缺少 name 字段'}), 400
+    if not data or 'name' not in data or 'candidate_id' not in data:
+        return jsonify({'ok': False,
+                        'error': '缺少 candidate_id 或 name 字段'}), 400
+    valid, error, cand = consume_package_candidate(
+        data.get('candidate_id'), data.get('name'), data.get('confidence'))
+    if not valid:
+        return jsonify({'ok': False, 'error': error}), 409
     qty = data.get('qty', 1)
-    cand = load_package_candidate() or {}
     bbox = data.get('bbox') or cand.get('bbox')
     source = data.get('source') or 'phone_ocr'
     inv = InventoryManager()
@@ -198,8 +240,6 @@ def api_package_confirm():
         expire_date=data.get('expire_date'), category=data.get('category'),
         shelf_id=data.get('shelf_id'))
     inv.close()
-    if ok:
-        clear_package_candidate()
     return jsonify({'ok': ok, 'msg': msg}), (200 if ok else 400)
 
 
@@ -249,7 +289,11 @@ def api_cloud_confirm():
                 category=data.get('category') or '云端识别',
                 shelf_id=data.get('shelf_id'))
     else:
-        cand = load_package_candidate() or {}
+        valid, error, cand = consume_package_candidate(
+            data.get('candidate_id'), data.get('name'), data.get('confidence'))
+        if not valid:
+            inv.close()
+            return jsonify({'ok': False, 'error': error}), 409
         bbox = data.get('bbox') or cand.get('bbox')
         ok, msg = inv.put_package(
             data['name'], qty, source='cloud', bbox=bbox,
@@ -257,8 +301,6 @@ def api_cloud_confirm():
             category=data.get('category') or '包装食品',
             shelf_id=data.get('shelf_id'))
     inv.close()
-    if ok:
-        clear_package_candidate()
     return jsonify({'ok': ok, 'msg': msg}), (200 if ok else 400)
 
 
