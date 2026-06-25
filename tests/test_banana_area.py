@@ -33,12 +33,23 @@ def test_small_area_jitter_is_ignored():
     assert result['direction'] == 'NO_LEVEL_CHANGE'
 
 
-def test_region_compare_uses_same_crop_and_can_override_wrong_yolo_class():
+def test_region_compare_requires_banana_yolo_gate():
     before = np.full((200, 300, 3), 40, dtype=np.uint8)
     after = before.copy()
     cv2.rectangle(after, (80, 60), (220, 140), (0, 255, 255), -1)
     result = compare_banana_region(
         before, after, (50, 40, 200, 120), yolo_class_ids=[9],
+        banana_class_id=2, excluded_class_ids={19}, min_delta_area_px=1000)
+    assert result['direction'] == 'PUT_IN'
+    assert result['is_banana_change'] is False
+
+
+def test_region_compare_accepts_yellow_change_after_banana_yolo():
+    before = np.full((200, 300, 3), 40, dtype=np.uint8)
+    after = before.copy()
+    cv2.rectangle(after, (80, 60), (220, 140), (0, 255, 255), -1)
+    result = compare_banana_region(
+        before, after, (50, 40, 200, 120), yolo_class_ids=[2],
         banana_class_id=2, excluded_class_ids={19}, min_delta_area_px=1000)
     assert result['direction'] == 'PUT_IN'
     assert result['is_banana_change'] is True

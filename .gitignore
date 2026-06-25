@@ -5,3 +5,15 @@ results/
 .claude/
 .idea/
 backups/
+node_modules/
+outputs/
+work/
+submission/
+pdf_images_export_hd/
+complex_conditions_output/
+.pytest_cache/
+.pytest_report_run*/
+.pytest_scoring_review/
+docs/_paper_render_fact_checked/
+source_design.pdf
+*.tmp

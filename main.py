@@ -25,6 +25,7 @@ from change_locator import find_change_regions, classify_regions
 from event_detector import EventDetector
 from inventory import InventoryManager
 from package_ocr import save_package_candidate
+from image_enhancement import enhance_low_light
 from banana_area import (calibrated_ratio as banana_calibrated_ratio,
                          compare_banana_region, measure_banana_area,
                          quantity_level as banana_level)
@@ -54,6 +55,25 @@ BANANA_CLASS_ID = CLASSES.index('banana')
 
 SHOW = '--show' in sys.argv    # 是否开实时显示窗口
 SHOW_INFER = '--show-infer' in sys.argv
+LOW_LIGHT_YOLO = (
+    '--enhance-low-light-yolo' in sys.argv
+    or os.getenv('ENABLE_LOW_LIGHT_YOLO', '0') == '1')
+LOW_LIGHT_YOLO_THRESHOLD = float(os.getenv('LOW_LIGHT_YOLO_THRESHOLD', '85'))
+
+
+def maybe_enhance_low_light_for_yolo(frame, label='frame'):
+    """低光时返回增强帧给 YOLO；原图仍用于运动/差分/保存证据。"""
+    if not LOW_LIGHT_YOLO:
+        return frame, None
+    enhanced, info = enhance_low_light(
+        frame, brightness_threshold=LOW_LIGHT_YOLO_THRESHOLD)
+    if info['applied']:
+        before = info['before']['mean_brightness']
+        after = info['after']['mean_brightness']
+        print(f'[LOW_LIGHT] {label}: YOLO 使用增强帧 '
+              f'brightness {before:.1f}->{after:.1f}')
+        return enhanced, info
+    return frame, info
 
 
 def _area_roi(frame, class_name):
@@ -253,7 +273,7 @@ def crop_by_bbox(frame, bbox):
 
 
 def save_event_crops(ref_frame, new_frame, regions, capture_info=None):
-    """保存事件最终变化区域的动作前后裁剪图，供离线分析与复盘。"""
+    """保存事件前后完整帧及最终变化区域裁剪图，供离线分析与复盘。"""
     if not regions:
         return None
 
@@ -263,6 +283,11 @@ def save_event_crops(ref_frame, new_frame, regions, capture_info=None):
     event_id = f'event_{stamp}_{idx:03d}'
     out_dir = os.path.join(DEBUG_CROP_DIR, event_id)
     os.makedirs(out_dir, exist_ok=True)
+
+    full_before_name = 'full_ref.jpg'
+    full_after_name = 'full_new.jpg'
+    cv2.imwrite(os.path.join(out_dir, full_before_name), ref_frame)
+    cv2.imwrite(os.path.join(out_dir, full_after_name), new_frame)
 
     items = []
     for i, region in enumerate(regions, start=1):
@@ -293,6 +318,10 @@ def save_event_crops(ref_frame, new_frame, regions, capture_info=None):
                 'before_semantic': 'before_action',
                 'after_semantic': 'after_action',
             },
+            'full_frames': {
+                'before_file': full_before_name,
+                'after_file': full_after_name,
+            },
             'regions': items,
         }, f, ensure_ascii=False, indent=2)
     print(f'[DEBUG_CROP] saved {out_dir}')
@@ -317,9 +346,26 @@ def apply_zoom_crop_egg_delta(model, ref_frame, new_frame, regions):
     delta = new_count - ref_count
     print(f'[EGG] zoom-crop count: {ref_count} -> {new_count}, '
           f'delta={delta}, bbox={bbox}, conf={EGG_COUNT_CONF_THRESH}')
+
+    # Small/partial egg crops are easy to miss or misclassify as Onion.
+    # If the zoom crop fails, fall back to whole-frame egg counting.
     if (abs(delta) < EGG_COUNT_MIN_DELTA
             or max(ref_count, new_count) < EGG_COUNT_MIN_TOTAL):
-        return regions
+        full_ref_count = count_class_full_frame(
+            model, ref_frame, EGG_CLASS_ID,
+            conf_thresh=EGG_COUNT_CONF_THRESH)
+        full_new_count = count_class_full_frame(
+            model, new_frame, EGG_CLASS_ID,
+            conf_thresh=EGG_COUNT_CONF_THRESH)
+        full_delta = full_new_count - full_ref_count
+        print(f'[EGG] full-frame fallback: {full_ref_count} -> '
+              f'{full_new_count}, delta={full_delta}, '
+              f'conf={EGG_COUNT_CONF_THRESH}')
+        if (abs(full_delta) < EGG_COUNT_MIN_DELTA
+                or max(full_ref_count, full_new_count) < EGG_COUNT_MIN_TOTAL):
+            return regions
+        bbox = (0, 0, new_frame.shape[1], new_frame.shape[0])
+        delta = full_delta
 
     from change_locator import ChangedRegion
     ident = {
@@ -337,11 +383,12 @@ def apply_zoom_crop_egg_delta(model, ref_frame, new_frame, regions):
 
 def infer_full_frame(model, frame):
     """Run YOLO on the current frame for --show debug visualization."""
-    img_input, ratio, pad = preprocess(frame)
+    yolo_frame, _ = maybe_enhance_low_light_for_yolo(frame, 'show')
+    img_input, ratio, pad = preprocess(yolo_frame)
     outputs = model.inference(inputs=[img_input])
     if outputs is None or outputs[0] is None:
         return None
-    return postprocess(outputs, ratio, pad, frame.shape)
+    return postprocess(outputs, ratio, pad, yolo_frame.shape)
 
 def _replay_dir():
     """命令行里找 --replay 的目录参数，没有返回 None"""
@@ -380,11 +427,12 @@ def open_source():
 
 def seed_detections(model, frame):
     """开机全画面检测一次，给位置记忆与库存播种"""
-    img_input, ratio, pad = preprocess(frame)
+    yolo_frame, _ = maybe_enhance_low_light_for_yolo(frame, 'seed')
+    img_input, ratio, pad = preprocess(yolo_frame)
     outputs = model.inference(inputs=[img_input])
     if outputs is None or outputs[0] is None:
         return []
-    boxes, confs, class_ids = postprocess(outputs, ratio, pad, frame.shape)
+    boxes, confs, class_ids = postprocess(outputs, ratio, pad, yolo_frame.shape)
     dets = []
     for box, cid in zip(boxes, class_ids):
         x1, y1, x2, y2 = box
@@ -414,6 +462,10 @@ def main():
             class_id = CLASSES.index(class_name)
             result = area_result(frame, class_name)
             action = actions.get(class_name, {})
+            if action.get('force_level') == '无':
+                result = dict(result)
+                result['level'] = '无'
+                result['ratio'] = 0.0
             inv.set_area_level(
                 class_id, result['level'], result['ratio'], result['area_px'],
                 action=action.get('direction'),
@@ -431,7 +483,9 @@ def main():
     def locate_fn(ref, new):
         bboxes = find_change_regions(ref, new)
         print(f'[DEBUG] 变化区域: {len(bboxes)} 个, boxes={bboxes}')
-        regions = classify_regions(ref, new, bboxes, classify_fn)
+        yolo_ref, _ = maybe_enhance_low_light_for_yolo(ref, 'event_ref')
+        yolo_new, _ = maybe_enhance_low_light_for_yolo(new, 'event_new')
+        regions = classify_regions(yolo_ref, yolo_new, bboxes, classify_fn)
         area_evidence = {
             ident['fine']
             for r in regions
@@ -439,6 +493,7 @@ def main():
             if ident is not None and ident.get('class_id') in AREA_LEVEL_CLASS_IDS
         }
         banana_delta_px = 0
+        banana_after_local_area_px = 0
         for region in regions:
             if region.kind not in ('APPEAR', 'DISAPPEAR', 'REPLACE'):
                 continue
@@ -455,6 +510,7 @@ def main():
             if not local['is_banana_change']:
                 continue
             banana_delta_px += local['delta_area_px']
+            banana_after_local_area_px += local['after']['area_px']
             area_evidence.add('banana')
             print('[AREA] 局部香蕉面积变化覆盖该区域的 YOLO 事件 '
                   f'direction={local["direction"]} '
@@ -468,7 +524,10 @@ def main():
                 'direction': 'PUT_IN' if banana_delta_px > 0 else 'TAKE_OUT',
                 'delta_area_px': banana_delta_px,
             }
-        regions = apply_zoom_crop_egg_delta(model, ref, new, regions)
+            if (banana_delta_px < 0
+                    and banana_after_local_area_px <= BANANA_CROP_MIN_DELTA_PX):
+                area_actions['banana']['force_level'] = '无'
+        regions = apply_zoom_crop_egg_delta(model, yolo_ref, yolo_new, regions)
         for r in regions:
             print(f'[DEBUG] 区域: kind={r.kind} ref={r.ref_ident} new={r.new_ident}')
         mark_package_take_out(regions, inv)

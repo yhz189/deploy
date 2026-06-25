@@ -126,8 +126,8 @@ def compare_banana_region(before_bgr, after_bgr, bbox,
                           min_delta_area_px=1000, **segment_kwargs):
     """Compare banana-colored area in the same before/after change crop.
 
-    Strong local color evidence may override a wrong YOLO class, but an
-    explicitly excluded class (for example egg) always keeps its own event.
+    Banana area is only used after YOLO has provided banana evidence. This
+    prevents yellow eggs or lighting from creating false banana inventory.
     """
     x, y, w, h = bbox
     before_crop = before_bgr[y:y + h, x:x + w]
@@ -141,12 +141,10 @@ def compare_banana_region(before_bgr, after_bgr, bbox,
     has_banana_yolo = (
         banana_class_id is not None and banana_class_id in class_ids)
     has_excluded_yolo = bool(class_ids.intersection(excluded_class_ids))
-    strong_local_change = (
-        result['direction'] != 'NO_LEVEL_CHANGE'
-        and abs(result['delta_area_px']) >= int(min_delta_area_px))
     result['is_banana_change'] = (
-        not has_excluded_yolo and (has_banana_yolo or strong_local_change)
-        and result['direction'] != 'NO_LEVEL_CHANGE')
+        not has_excluded_yolo and has_banana_yolo
+        and result['direction'] != 'NO_LEVEL_CHANGE'
+        and abs(result['delta_area_px']) >= int(min_delta_area_px))
     result['has_banana_yolo'] = has_banana_yolo
     result['has_excluded_yolo'] = has_excluded_yolo
     result['bbox'] = bbox

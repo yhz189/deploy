@@ -28,7 +28,7 @@ def test_stock_api_returns_level_fields_and_supports_manual_level(tmp_path):
     assert response.status_code == 404
 
 
-def test_level_none_remains_visible_in_stock_api(tmp_path):
+def test_level_none_is_hidden_in_stock_api(tmp_path):
     inventory.DB_PATH = str(tmp_path / 'inventory.db')
     client = web_server.app.test_client()
     response = client.post('/api/stock/adjust-level', json={
@@ -37,6 +37,4 @@ def test_level_none_remains_visible_in_stock_api(tmp_path):
     })
     assert response.status_code == 200
     stock = client.get('/api/stock').get_json()
-    assert stock[0]['name'] == 'carrot'
-    assert stock[0]['qty'] == 0
-    assert stock[0]['display_amount'] == '无'
+    assert stock == []

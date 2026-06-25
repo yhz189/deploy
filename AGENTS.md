@@ -50,6 +50,8 @@ python -m pytest tests/ -q
 ## 协作偏好
 
 - **用中文沟通。**
+- 每次改代码、加功能、调试部署或做关键技术决策后，更新 `docs/技术演进记录.md`。
+- 每次用户提出关键困惑或知识盲区问题后，更新 `docs/问题汇总.md`。
 - 改完文件后，直接给出 scp 部署命令供复制粘贴，格式：
   ```
   scp "C:\Users\hp-pc\Desktop\deploy\<文件>" root@192.168.3.100:/root/2_deploy/

@@ -39,9 +39,11 @@ def test_area_level_none_removes_item_and_records_level_change(tmp_path):
         inv.set_area_level(banana_id, '大量', 0.8, 20000)
         inv.set_area_level(banana_id, '无', 0.0, 0)
         records = inv.get_current_stock_records()
-        assert records[0]['amount_level'] == '无'
-        assert records[0]['display_amount'] == '无'
-        assert records[0]['qty'] == 0
+        assert records == []
+        status = inv.conn.execute(
+            "SELECT status FROM inventory WHERE class_name='banana'"
+        ).fetchone()[0]
+        assert status == 'out'
         events = inv.get_recent_events(2)
         assert events[0][1] == 'AREA_LEVEL_CHANGE'
         assert '大量→无' in events[0][2]

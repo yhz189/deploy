@@ -177,7 +177,7 @@ class InventoryManager:
             (cls_id,)
         ).fetchone()
         quantity = 0 if level == '无' else 1
-        status = 'in'
+        status = 'out' if level == '无' else 'in'
 
         if row:
             rec_id, old_level, first_in = row
@@ -509,7 +509,8 @@ class InventoryManager:
         """获取当前在库食材"""
         rows = self.conn.execute(
             "SELECT class_name, quantity, first_in, last_update FROM inventory "
-            "WHERE status='in' AND (quantity>0 OR amount_mode='level') "
+            "WHERE status='in' AND (quantity>0 OR "
+            "(amount_mode='level' AND amount_level!='无')) "
             "ORDER BY last_update DESC"
         ).fetchall()
         return rows
@@ -520,7 +521,8 @@ class InventoryManager:
             "SELECT class_name, quantity, first_in, last_update, item_type, "
             "source, expire_date, category, shelf_id, amount_mode, "
             "amount_level, amount_ratio, area_px FROM inventory "
-            "WHERE status='in' AND (quantity>0 OR amount_mode='level') "
+            "WHERE status='in' AND (quantity>0 OR "
+            "(amount_mode='level' AND amount_level!='无')) "
             "ORDER BY last_update DESC"
         ).fetchall()
         return [
